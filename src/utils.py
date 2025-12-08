@@ -15,10 +15,10 @@ def patchify(x, patch_size):
     x = x.reshape(bsz, h_ * w_, c * p ** 2)
     return x  # [n, l, d]
 
-def unpatchify(x, patch_size, seq_len):
+def unpatchify(x, patch_size, seq_len, channels=3):
     bsz = x.shape[0]
     p = patch_size
-    c = 1
+    c = channels
     h_, w_ = int(math.sqrt(seq_len)), int(math.sqrt(seq_len))
 
     x = x.reshape(bsz, h_, w_, c, p, p)
@@ -48,8 +48,9 @@ def compute_loss(x1, eps, xt, t, pred_raw, pred_type, loss_type, debug=False):
         # v_target = x1 - eps
         v_target = (x1 - xt) / (1 - t).clamp(min=0.05)
         if debug:
-            save_patch_as_figure(x1[0], filename="x.png")
-            save_patch_as_figure(x1_hat[0], filename="x_prediction.png")
+            pass
+            #save_patch_as_figure(x1[0], filename="x.png")
+            #save_patch_as_figure(x1_hat[0], filename="x_prediction.png")
         return ((v_hat - v_target)**2).mean()
     
     elif loss_type == "x":
@@ -93,23 +94,38 @@ def load_checkpoint(path, mae, denoising_mlp, optimizer):
     denoising_mlp.load_state_dict(checkpoint["denoising_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
     
-def save_patch_as_figure(x, filename, path="./output"):
-    x = unpatchify(x.unsqueeze(0), patch_size=1, seq_len=1)
+def save_patch_as_figure(x, filename, path="./output", channels=3):
+    x = x.unsqueeze(0)
+    x = unpatchify(x, patch_size=1, seq_len=x.shape[1], channels=channels)
     with torch.no_grad():
         patch_img = x.squeeze().cpu().numpy()
     plt.figure()
     plt.imshow(patch_img, cmap="gray")
     plt.axis("off")
+    os.makedirs(path, exist_ok=True)
     plt.savefig(f"{path}/" + filename)
     plt.close()
 
-def save_img_as_fig(x, patch_size, filename, path="./output"):
-    x = unpatchify(x, patch_size=patch_size, seq_len=x.shape[1])
+def save_token_as_fig(x, patch_size, filename, path="./output", channels=1):
+    x = unpatchify(x, patch_size=patch_size, seq_len=x.shape[1], channels=channels)
     with torch.no_grad():
+        x = x.permute(0, 2, 3, 1)
         img = x.squeeze().cpu().numpy()
     plt.figure()
     plt.imshow(img[0], cmap="gray")
     plt.axis("off")
+    os.makedirs(path, exist_ok=True)
+    plt.savefig(f"{path}/" + filename)
+    plt.close()
+
+def save_img_as_fig(x, filename, path="./output"):
+    with torch.no_grad():
+        x = x.permute(0, 2, 3, 1)
+        img = x.squeeze().cpu().numpy()
+    plt.figure()
+    plt.imshow(img[0], cmap="gray")
+    plt.axis("off")
+    os.makedirs(path, exist_ok=True)
     plt.savefig(f"{path}/" + filename)
     plt.close()
 
@@ -121,11 +137,12 @@ def save_multiple_imgs_as_fig(imgs, patch_size, filename, path="./output"):
     plt.figure(figsize=(n_col, n_row))
     for i in range(bsz):
         if imgs.shape[1] == 1:
-            plot = imgs[i, 0]
+            plot = imgs[i, 0].cpu().numpy()
         else:
-            plot = imgs[i]
+            plot = imgs[i].permute(1, 2, 0)
+            plot = plot.cpu().numpy()
         plt.subplot(n_row, n_col, i + 1)
-        plt.imshow(plot)
+        plt.imshow(plot, cmap="gray")
         plt.axis("off")
 
     plt.suptitle("Generated Batch Samples")

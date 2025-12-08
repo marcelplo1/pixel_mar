@@ -1,6 +1,7 @@
 import torch
 import torch.optim as optim
-from src.utils import patchify, unpatchify, sample_order, random_masking, compute_loss
+import numpy as np
+from utils import patchify, sample_order, compute_loss, save_token_as_fig
 
 
 def random_masking(x, orders, min_mask_rate=0.7):
@@ -15,13 +16,17 @@ def random_masking(x, orders, min_mask_rate=0.7):
 def train_one_epoch(dataloader, mae, denoising_mlp, optimizer, patch_size, min_mask_rate, device, debug=False):
     t_eps = 1e-2
 
+    losses = []
     for samples, labels in dataloader:
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
         x = patchify(samples, patch_size)
-        orders = sample_order(x.shape[0], x.shape[1], device    )
+        orders = sample_order(x.shape[0], x.shape[1], device)
         mask = random_masking(x, orders, min_mask_rate)
+
+        if debug:
+            save_token_as_fig(x*mask.unsqueeze(-1), patch_size=patch_size, filename="mask_.png", path="./output")
 
         z = mae(x, mask)
 
@@ -37,9 +42,10 @@ def train_one_epoch(dataloader, mae, denoising_mlp, optimizer, patch_size, min_m
 
         patch_prediction = denoising_mlp(torch.cat([xt, z], dim=1), t)
 
-        loss = compute_loss(gt, eps, xt, t, patch_prediction, pred_type="eps", loss_type="eps", debug=debug)
+        loss = compute_loss(gt, eps, xt, t, patch_prediction, pred_type="x", loss_type="v", debug=debug)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        losses.append(loss.item())
 
-        return loss.item()
+    return losses
