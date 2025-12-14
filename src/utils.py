@@ -34,96 +34,26 @@ def sample_order(bsz, seq_len, device):
         orders.append(order)
     orders = torch.tensor(np.array(orders), device=device)
     return orders
-
-def compute_loss(x1, eps, xt, t, pred_raw, pred_type, loss_type, debug=False):
-    if loss_type == "v":
-        if pred_type == "x":
-            x1_hat = pred_raw
-            v_hat = (x1_hat - xt) / (1-t).clamp(min=0.05)
-        elif pred_type == "eps":
-            eps_hat = pred_raw
-            v_hat = (xt - eps_hat) / t
-        elif pred_type == "v":
-            v_hat = pred_raw
-        # v_target = x1 - eps
-        v_target = (x1 - xt) / (1 - t).clamp(min=0.05)
-        if debug:
-            pass
-            #save_patch_as_figure(x1[0], filename="x.png")
-            #save_patch_as_figure(x1_hat[0], filename="x_prediction.png")
-        return ((v_hat - v_target)**2).mean()
     
-    elif loss_type == "x":
-        if pred_type == "x":
-            x1_hat = pred_raw
-        elif pred_type == "eps":
-            eps_hat = pred_raw
-            x1_hat = (xt - eps_hat*(1-t)) / t
-        elif pred_type == "v":
-            v_hat = pred_raw
-            x1_hat = xt + (1 - t) * v_hat
-        if debug:
-            save_patch_as_figure(x1[0], filename="x.png")
-            save_patch_as_figure(x1_hat[0], filename="x_prediction.png")
-        return ((x1_hat - x1)**2).mean()
-
-    elif loss_type == "eps":
-        if pred_type == "x":
-            x1_hat = pred_raw
-            eps_hat = (xt - t*x1_hat) / (1 - t)
-        elif pred_type == "eps":
-            eps_hat = pred_raw
-        elif pred_type == "v":
-            v_hat = pred_raw
-            eps_hat = xt - t * v_hat
-        if debug:
-            save_patch_as_figure(x1[0], filename="x.png")
-            save_patch_as_figure(x1_hat[0], filename="x_prediction.png")
-        return ((eps_hat - eps)**2).mean()
-    
-def save_checkpoint(path, mae, denoising_mlp, optimizer):
+def save_checkpoint(path, mae, denoiser, optimizer):
     torch.save({
         "mae_state_dict": mae.state_dict(),
-        "denoising_state_dict": denoising_mlp.state_dict(),
+        "denoising_state_dict": denoiser.state_dict(),
         "optimizer_state_dict": optimizer.state_dict()
     }, path)
 
-def load_checkpoint(path, mae, denoising_mlp, optimizer):
+def load_checkpoint(path, mae, denoiser, optimizer):
     checkpoint = torch.load(path)
     mae.load_state_dict(checkpoint["mae_state_dict"])
-    denoising_mlp.load_state_dict(checkpoint["denoising_state_dict"])
+    denoiser.load_state_dict(checkpoint["denoising_state_dict"])
     optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-    
-def save_patch_as_figure(x, filename, path="./output", channels=3):
-    x = x.unsqueeze(0)
-    x = unpatchify(x, patch_size=1, seq_len=x.shape[1], channels=channels)
-    with torch.no_grad():
-        patch_img = x.squeeze().cpu().numpy()
-    plt.figure()
-    plt.imshow(patch_img, cmap="gray")
-    plt.axis("off")
-    os.makedirs(path, exist_ok=True)
-    plt.savefig(f"{path}/" + filename)
-    plt.close()
-
-def save_token_as_fig(x, patch_size, filename, path="./output", channels=1):
-    x = unpatchify(x, patch_size=patch_size, seq_len=x.shape[1], channels=channels)
-    with torch.no_grad():
-        x = x.permute(0, 2, 3, 1)
-        img = x.squeeze().cpu().numpy()
-    plt.figure()
-    plt.imshow(img[0], cmap="gray")
-    plt.axis("off")
-    os.makedirs(path, exist_ok=True)
-    plt.savefig(f"{path}/" + filename)
-    plt.close()
 
 def save_img_as_fig(x, filename, path="./output"):
     with torch.no_grad():
-        x = x.permute(0, 2, 3, 1)
-        img = x.squeeze().cpu().numpy()
+        gen_img = np.round(np.clip(x[0].float().cpu().numpy().transpose([1, 2, 0]) * 255, 0, 255))
+        gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
     plt.figure()
-    plt.imshow(img[0], cmap="gray")
+    plt.imshow(gen_img)
     plt.axis("off")
     os.makedirs(path, exist_ok=True)
     plt.savefig(f"{path}/" + filename)
@@ -156,5 +86,6 @@ def save_plot(data, filename, path="./output"):
     plt.xlabel("Epochs")
     plt.ylabel("Loss")
     plt.title(f"{filename.split('.')[0]} over Epochs")
+    os.makedirs(path, exist_ok=True)
     plt.savefig(f"{path}/" + filename)
     plt.close()

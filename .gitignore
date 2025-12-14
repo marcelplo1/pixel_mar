@@ -1,6 +1,7 @@
 # Ignore output and log files
 output/*
 logs/*
+storage/*
 
 # Ignore Python cache files
 __pycache__/
@@ -15,3 +16,6 @@ env/
 
 # Ignore dataset files
 data/*
+
+# VSCode settings
+.vscode/

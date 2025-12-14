@@ -1,8 +1,10 @@
+import math
 import torch
 import torch.nn as nn
 
 class MAE(nn.Module):
-    def __init__(self, img_size, patch_size=16, hidden_dim=768, channels=3, mlp_ratio=4.0, depth=12, proj_dropout=0.0):
+    def __init__(self, img_size, patch_size=16, hidden_dim=768, 
+                 channels=3, mlp_ratio=4.0, depth=2, proj_dropout=0.0):
         super().__init__()
 
         self.image_size = img_size
@@ -11,32 +13,36 @@ class MAE(nn.Module):
         self.embed_dim = channels * patch_size**2
         self.hidden_dim = hidden_dim
 
-        self.input_proj = nn.Linear(self.embed_dim, hidden_dim)
+        self.input_proj  = nn.Linear(self.embed_dim, hidden_dim)
         self.output_proj = nn.Linear(hidden_dim, self.embed_dim)
-        self.mask_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        self.mask_token  = nn.Parameter(torch.zeros(1, 1, hidden_dim))
 
-        encder_pos_emb = get_2d_sincos_pos_embed(hidden_dim, img_size // patch_size, img_size // patch_size)
-        self.encoder_pos_emb = nn.Parameter(encder_pos_emb, requires_grad=True)
-        decoder_pos_emb = get_2d_sincos_pos_embed(hidden_dim, img_size // patch_size, img_size // patch_size)
-        self.decoder_pos_emb = nn.Parameter(decoder_pos_emb,  requires_grad=True)
-        diffusion_pos_emb = get_2d_sincos_pos_embed(self.embed_dim, img_size // patch_size, img_size // patch_size)
-        self.diffusion_pos_emb = nn.Parameter(diffusion_pos_emb,  requires_grad=True)
-
+        # Positional embeddings
+        self.encoder_pos_emb   = nn.Parameter(get_2d_sincos_pos_embed(hidden_dim, img_size // patch_size, img_size // patch_size), requires_grad=True)
+        self.decoder_pos_emb   = nn.Parameter(get_2d_sincos_pos_embed(hidden_dim, img_size // patch_size, img_size // patch_size), requires_grad=True)
+        self.diffusion_pos_emb = nn.Parameter(get_2d_sincos_pos_embed(self.embed_dim, img_size // patch_size, img_size // patch_size), requires_grad=True)
+        
         # self.encoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len , self.hidden_dim), requires_grad=True)
         # self.decoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len , self.hidden_dim),  requires_grad=True)
         # self.diffusion_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len , self.embed_dim),  requires_grad=True)
 
-        self.encoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=hidden_dim // 16,
+            dim_feedforward=int(hidden_dim * mlp_ratio),
+            dropout=proj_dropout,
+            batch_first=True
         )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=depth)
 
-        self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim)
+        decoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=hidden_dim // 16,
+            dim_feedforward=int(hidden_dim * mlp_ratio),
+            dropout=proj_dropout,
+            batch_first=True
         )
+        self.decoder = nn.TransformerEncoder(decoder_layer, num_layers=depth)
 
     def forward(self, x, mask):
         x = self.input_proj(x)
@@ -59,26 +65,76 @@ class MAE(nn.Module):
 
         return decoded
     
+class Embedder(nn.Module):
+    def __init__(self, input_size, hidden_size):
+        super().__init__()
+        self.embedder = nn.Embedding(input_size, hidden_size)
+
+    def forward(self, x):
+        embeddings = self.embedder(x)
+        return embeddings
+    
+class TimestepEmbedder(nn.Module):
+    """
+    Embeds scalar timesteps into vector representations.
+    """
+    def __init__(self, hidden_size, frequency_embedding_size=256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
+            nn.SiLU(),
+            nn.Linear(hidden_size, hidden_size, bias=True),
+        )
+        self.frequency_embedding_size = frequency_embedding_size
+
+    @staticmethod
+    def timestep_embedding(t, dim, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                          These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        half = dim // 2
+        freqs = torch.exp(
+            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+        ).to(device=t.device)
+        args = t[:, None].float() * freqs[None]
+        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+        if dim % 2:
+            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
+        return embedding
+
+    def forward(self, t):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+        t_emb = self.mlp(t_freq)
+        return t_emb
+
 
 class DenoisingMLP(nn.Module):
-    def __init__(self, input_dim, output_dim, hidden_dim=512):
+    def __init__(self, input_dim, output_dim, number_classes, seq_len, batch_size, hidden_dim=512):
         super().__init__()
-        self.time_emb = nn.Sequential(
-            nn.Linear(1, input_dim),
-            nn.ReLU(),
-            nn.Linear(input_dim, input_dim)
-        )
+        self.t_embedder = TimestepEmbedder(input_dim)
+        self.y_embedder = Embedder(number_classes, input_dim)
+
         self.net = nn.Sequential(
-            nn.Linear(2*input_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
+            nn.Linear(3*input_dim, hidden_dim), nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim), nn.SiLU(),
             nn.Linear(hidden_dim, output_dim)
         )
 
-    def forward(self, x, t):
-        t_emb = self.time_emb(t)
-        out = self.net(torch.cat((x, t_emb), dim=-1))
+    def forward(self, x, z, t, y):
+        t_emb = self.t_embedder(t)
+        y_emb = self.y_embedder(y)
+        c = t_emb + y_emb
+        c = c.unsqueeze(1).expand(-1, x.shape[1], -1)
+
+        out = self.net(torch.cat((x, c, z), dim=-1))
         return out
-    
+
     
 def get_2d_sincos_pos_embed(embed_dim, grid_size_h, grid_size_w):
     grid_h = torch.arange(grid_size_h, dtype=torch.float32)
