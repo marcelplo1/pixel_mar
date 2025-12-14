@@ -37,7 +37,7 @@ def train_one_epoch(args, dataloader, mae, denoiser, optimizer, device, global_r
         losses.append(loss.item())
 
         if args.is_debug and global_rank == 0:
-            save_img_as_fig(unpatchify(x*mask.unsqueeze(-1), args.patch_size, x.shape[1], args.channels), filename="mask.png", path="./output")
+            save_img_as_fig(unpatchify(x*mask.unsqueeze(-1), args.patch_size, x.shape[1], args.channels), filename="mask.png", path=args.output_dir)
 
     return losses
 

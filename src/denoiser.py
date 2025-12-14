@@ -78,9 +78,9 @@ class Denoiser(nn.Module):
         loss = loss.mean()
 
         if self.is_debug:
-            save_img_as_fig(unpatchify(x.reshape(x.shape[0], x.shape[1], -1), self.patch_size , x.shape[1], self.channels), filename="ground_truth.png", path="./output")
-            save_img_as_fig(unpatchify(x_pred.reshape(x.shape[0], x.shape[1], -1), self.patch_size, x.shape[1], self.channels), filename="prediction.png", path="./output")
-        
+            save_img_as_fig(unpatchify(x.reshape(x.shape[0], x.shape[1], -1), self.patch_size , x.shape[1], self.channels), filename="ground_truth.png", path=self.output_dir)
+            save_img_as_fig(unpatchify(x_pred.reshape(x.shape[0], x.shape[1], -1), self.patch_size, x.shape[1], self.channels), filename="prediction.png", path=self.output_dir)
+
         return loss
 
     @torch.no_grad()
