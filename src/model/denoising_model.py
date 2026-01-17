@@ -1,8 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-import torch.nn.functional as F
-from utils.utils import RMSNorm, get_2d_sincos_pos_embed
+from utils.utils import RMSNorm
 
 
 def modulate(x, shift, scale):
@@ -12,18 +11,16 @@ class FinalLayer(nn.Module):
     """
     The final layer with a possible bottleneck layer
     """
-    def __init__(self, hidden_dim, patch_size, out_channels, bottleneck_dim=8):
+    def __init__(self, hidden_dim, patch_size, out_channels, bottleneck_dim=64):
         super().__init__()
         self.norm_final = RMSNorm(hidden_dim)
         self.linear = nn.Linear(hidden_dim, patch_size * patch_size * out_channels, bias=True)
-        bottleneck_dim = hidden_dim
         self.adaLN_modulation = nn.Sequential(
-            nn.Linear(hidden_dim, bottleneck_dim),
             nn.SiLU(),
-            nn.Linear(bottleneck_dim, 2 * hidden_dim, bias=True)
+            nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
         )
-
-    @torch.compile
+ 
+    #@torch.compile
     def forward(self, x, c_token):
         shift, scale = self.adaLN_modulation(c_token).chunk(2, dim=-1)
         x = modulate(self.norm_final(x), shift, scale)
@@ -52,13 +49,13 @@ class ResBlock(nn.Module):
             nn.Linear(hidden_dim, 3 * hidden_dim, bias=True)
         )
 
-    @torch.compile
+    #@torch.compile
     def forward(self, x, c_token):        
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c_token).chunk(3, dim=-1)
         h = modulate(self.in_ln(x), shift_mlp, scale_mlp)
         h = self.mlp(h)
         return x + gate_mlp * h
-
+        #return gate_mlp * h
 
 class DenoisingMLP(nn.Module):
     """
@@ -66,33 +63,30 @@ class DenoisingMLP(nn.Module):
     """
     def __init__(
         self,
-        input_size=256,
-        patch_size=16,
-        in_channels=3,
+        img_size=256,
+        channels=3,
+        num_classes=10,
         hidden_dim=768,
         mae_hidden_dim=768,
+        patch_size=16,
         depth=6,
-        num_heads=16,
-        num_classes=10,
-        bottleneck_dim=64,
+        final_bottleneck_dim=64,
+        ema_decay=0.999
     ):
         super().__init__()
-        self.in_channels = in_channels
-        self.out_channels = in_channels
+        self.in_channels = channels
+        self.out_channels = channels
         self.patch_size = patch_size
-        self.num_heads = num_heads
         self.hidden_dim = hidden_dim
-        self.input_size = input_size
+        self.img_size = img_size
         self.num_classes = num_classes
 
-        self.embedding_dim = in_channels * patch_size**2
-        self.num_patches = (input_size // patch_size) ** 2
-
-        self.t_embedder = TimestepEmbedder(hidden_dim)
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, hidden_dim))  #TODO
+        self.embedding_dim = channels * patch_size**2
+        self.num_patches = (img_size // patch_size) ** 2
 
         self.input_proj = nn.Linear(self.embedding_dim, hidden_dim)
-        self.c_token_proj = nn.Linear(mae_hidden_dim, hidden_dim, bias=True)
+        self.t_embedder = TimestepEmbedder(hidden_dim)
+        self.c_token_proj = nn.Linear(mae_hidden_dim, hidden_dim)
 
         self.blocks = nn.ModuleList([
             ResBlock(hidden_dim, self.embedding_dim)
@@ -100,28 +94,54 @@ class DenoisingMLP(nn.Module):
         ])
 
         # linear predict with bottleneck layer
-        self.final_layer = FinalLayer(hidden_dim, patch_size, self.out_channels, bottleneck_dim)
+        self.final_layer = FinalLayer(hidden_dim, patch_size, self.out_channels, final_bottleneck_dim)
 
         self.initialize_weights()
+        #self.initialize_weights_wo_residual()
 
     def initialize_weights(self):
-        # Init pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.num_patches ** 0.5))
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
 
-        # Init of time_embedder
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
-        # Zero-out adaLN modulation layers:
         for block in self.blocks:
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
-        # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.linear.weight, 0)
+        nn.init.constant_(self.final_layer.linear.bias, 0)
 
+    def initialize_weights_wo_residual(self):
+        def _basic_init(module):
+            if isinstance(module, nn.Linear):
+                torch.nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.constant_(module.bias, 0)
+        self.apply(_basic_init)
+
+        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
+
+        for block in self.blocks:
+            # We use Xavier/Kaiming so the gates (gate_mlp) start with non-zero values.
+            nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+
+            # Initialize MLP weights using Kaiming Normal for SiLU activation
+            for m in block.mlp.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
+                    if m.bias is not None:
+                        nn.init.constant_(m.bias, 0)
+                        
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -182,30 +202,6 @@ class TimestepEmbedder(nn.Module):
         t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
         t_emb = self.mlp(t_freq)
         return t_emb
-
-class LabelEmbedder(nn.Module):
-    """
-    Embeds class labels into a vector representations
-    """
-    def __init__(self, num_classes, hidden_size):
-        super().__init__()
-        self.embedding_table = nn.Embedding(num_classes + 1, hidden_size)
-        self.num_classes = num_classes
-
-    def forward(self, labels):
-        embeddings = self.embedding_table(labels)
-        return embeddings
     
-
-def denoisingMLP_S_04(**kwargs):
-    return DenoisingMLP(depth=6, hidden_dim=256, num_heads=6, patch_size=4, **kwargs)
-
-def denoisingMLP_B_16(**kwargs):
-    return DenoisingMLP(depth=12, hidden_dim=768, num_heads=12, patch_size=16, **kwargs)
-
-denoising_models = {
-    'denoisingMLP-S/04' : denoisingMLP_S_04,
-    'denoisingMLP-B/16': denoisingMLP_B_16,
-}
 
 

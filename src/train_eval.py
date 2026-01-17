@@ -8,8 +8,9 @@ import torch
 import numpy as np
 from sample import sample
 import torch_fidelity
+from utils.wandb_utils import log
 
-from utils.utils import adjust_learning_rate, patchify, sample_order, save_multiple_imgs_as_fig
+from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, unpatchify
 
 def random_masking(x, orders, min_mask_rate=0.7):
     bsz, seq_len, embed_dim = x.shape
@@ -21,9 +22,12 @@ def random_masking(x, orders, min_mask_rate=0.7):
                             src=torch.ones(bsz, seq_len, device=x.device))
     return mask
 
-def train_one_epoch(args, epoch, dataloader, mae, denoiser, optimizer, device, global_rank=0):
+def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, optimizer, device, global_rank=0):
     mae.train()
     denoiser.train()    
+
+    local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     
     losses = []
     for step, (samples, labels) in enumerate(dataloader):
@@ -31,11 +35,11 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, optimizer, device, g
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        x = patchify(samples, args.patch_size)
+        x = patchify(samples, mae_single.patch_size)
         orders = sample_order(x.shape[0], x.shape[1], device)
         mask = random_masking(x, orders, args.min_mask_rate)
 
-        z = mae(x, mask, labels)
+        z, masked_x = mae(x, mask, labels)
         
         loss = denoiser(x, z, mask)
 
@@ -43,18 +47,27 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, optimizer, device, g
         loss.backward()
         optimizer.step()
 
-        mae.update_ema()
-        denoiser.update_ema()
+        torch.cuda.synchronize()
+
+        mae_single.update_ema()
+        denoiser_single.update_ema()
+
+        if args.use_wandb and local_rank == 0:
+            stats = {
+                "train/loss": loss.item(),
+                "train/lr": optimizer.param_groups[0]['lr'],
+            }
+            optimizer_step = step + epoch*len(dataloader)
+            log(stats, step=optimizer_step)
 
         losses.append(loss.item())
 
-        if args.is_debug and global_rank == 0:
-            pass
-            #save_img_as_fig(unpatchify(x*mask.unsqueeze(-1), args.patch_size, x.shape[1], args.channels), filename="mask.png", path=args.output_dir)
+        # if args.is_debug and global_rank == 0:
+        #     save_img_as_fig(unpatchify(masked_x, args.patch_size, x.shape[1], args.channels), filename="mask.png", path=args.output_dir)
 
     return losses
 
-def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, fids=None, dataset=None):
+def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, metrics=None):
     mae.eval()
     denoiser.eval()
 
@@ -62,11 +75,11 @@ def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, fids=None, 
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     save_folder_fid = os.path.join(args.output_dir, "generation_{}_fid".format(args.dataset))
-    os.makedirs(save_folder_fid, exist_ok=True)
+    class_folder = os.path.join(args.output_dir, "generation_{}".format(args.dataset), 'epoch{}'.format(epoch))
 
-    folder_class = os.path.join(args.output_dir, "generation_{}".format(args.dataset))
-    folder_class = os.path.join(folder_class, 'epoch{}'.format(epoch))
-    os.makedirs(folder_class, exist_ok=True)
+    if local_rank == 0: 
+        os.makedirs(class_folder, exist_ok=True)
+        os.makedirs(save_folder_fid, exist_ok=True)
 
     if args.activate_ema: 
         mae_state_dict = copy.deepcopy(mae.state_dict())
@@ -98,32 +111,31 @@ def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, fids=None, 
         labels_gen = class_label_gen_world[start_idx:end_idx]
         labels_gen = torch.Tensor(labels_gen).long().cuda()
         
+        torch.distributed.barrier()
+
         sampled_images = sample(args, mae, denoiser, labels_gen, device)
         sampled_images = (sampled_images + 1) / 2
         sampled_images = sampled_images.detach().cpu()
 
-        torch.distributed.barrier() if torch.distributed.is_initialized() else None
+        for b_id in range(sampled_images.size(0)):
+            img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
+            if img_id >= args.num_images:
+                break
+            resize = transforms.Resize((args.sampled_img_size, args.sampled_img_size), interpolation=transforms.InterpolationMode.BILINEAR)
+            #img_down = resize(sampled_images[b_id])
+            img_down = sampled_images[b_id] # TODO
+            gen_img = np.round(np.clip(img_down.numpy().transpose([1, 2, 0]) * 255, 0, 255))
+            gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
+            cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
 
-        if global_rank == 0:
-            if epoch is not None:
-                for b_id in range(sampled_images.size(0)):
-                    img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-                    if img_id >= args.num_images:
-                        break
-                    resize = transforms.Resize((args.sampled_img_size, args.sampled_img_size), interpolation=transforms.InterpolationMode.BILINEAR)
-                    img_down = resize(sampled_images[b_id])
-                    gen_img = np.round(np.clip(img_down.numpy().transpose([1, 2, 0]) * 255, 0, 255))
-                    gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-                    cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
+            cls = int(labels_gen[b_id].item())
+            
+            if cls < args.class_num and local_rank == 0 and not saved_one_per_class[cls]:
+                class_filename = f'sample_class_{cls}_rank_{local_rank}.png'
+                cv2.imwrite(os.path.join(class_folder, class_filename), gen_img)
+                saved_one_per_class[cls] = True
 
-                    cls = int(labels_gen[b_id].item())
-                  
-                    if cls < args.class_num and not saved_one_per_class[cls]:
-                        cv2.imwrite(os.path.join(folder_class, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
-                        saved_one_per_class[cls] = True
-
-            else:
-                save_multiple_imgs_as_fig(sampled_images, args.patch_size, filename=f"sampled_batch_{step}.png", path=args.output_dir)
+    torch.distributed.barrier()
 
     if args.activate_ema:
         print("Switch back from ema")
@@ -135,24 +147,28 @@ def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, fids=None, 
     fid = False
     kid = False
     prc = False
-    if args.dataset == 'imagenet':
+    if args.dataset == 'imagenet100':
         input2 = None
         fid_statistics_file = 'fid_stats/adm_in256_stats.npz'
         fid = True
         isc = True
     elif args.dataset == 'cifar10':
-        input2 = Input2Dataset(dataset)
-        fid_statistics_file = None
+        input2 = None
+        if args.sampled_img_size == 32:
+            fid_statistics_file = 'fid_stats/adm_cifar10-32_fid_stats.npz'
+        elif args.sampled_img_size == 64:
+            fid_statistics_file = 'fid_stats/adm_cifar10-64_fid_stats.npz'
+        else:
+            return
         fid = True
         isc = True
     elif args.dataset == 'mnist':
-        input2 = Input2Dataset(dataset)
-        fid_statistics_file = None
+        input2 = None
+        fid_statistics_file = 'fid_stats/adm_mnist-64_fid_stats.npz'
         fid = True
-    else: # TODO
-        input2 = Input2Dataset(dataset)
-        fid_statistics_file = None
-        fid = True
+        isc = True
+    else:
+        return
     metrics_dict = torch_fidelity.calculate_metrics(
         input1=save_folder_fid,
         input2=input2,
@@ -167,32 +183,34 @@ def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, fids=None, 
     if fid:
         fid_score = metrics_dict['frechet_inception_distance']
         print("FID: {:.4f}".format(fid_score))
-        if fids is not None:
-            fids.append(fid_score)
+        if metrics['fid'] is not None:
+            metrics['fid'].append(fid_score)
     if isc:
         inception_score = metrics_dict['inception_score_mean']
         print("Inception Score: {:.4f}".format(inception_score))
+        if metrics['is'] is not None:
+            metrics['is'].append(inception_score)
     if kid:
         kid_score = metrics_dict['kernel_inception_distance_mean']
         print("KID: {:.4f}".format(kid_score))
     if prc:
-        pass
+        precision = metrics_dict['precision']
+        recall = metrics_dict['recall']
+        print("Precision: {:.4f}".format(precision))
+        print("Recall: {:.4f}".format(recall))      
+        if metrics['precision'] is not None:
+            metrics['precision'].append(precision)
+        if metrics['recall'] is not None:
+            metrics['recall'].append(recall)
 
-    shutil.rmtree(save_folder_fid)
-
+    torch.distributed.barrier()
     
-class Input2Dataset(torch.utils.data.Dataset):
-    def __init__(self, base_dataset):
-        self.base_dataset = base_dataset
-
-    def __getitem__(self, index):
-        img, _ = self.base_dataset[index]
-        img = img.mul(0.5).add_(0.5)
-          
-        # Scale to [0, 255] and convert to uint8
-        img = (img * 255).clamp(0, 255).to(torch.uint8)
-        
-        return img
-
-    def __len__(self):
-        return len(self.base_dataset)
+    if local_rank == 0:
+        if args.use_wandb:
+            stats = {
+                "evaluate/fid": fid_score,
+                "evaluate/is": inception_score,
+                "epoch" : epoch
+            }
+            log(stats)
+        shutil.rmtree(save_folder_fid)

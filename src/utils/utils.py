@@ -1,3 +1,4 @@
+import csv
 import os
 import cv2
 import torch
@@ -5,6 +6,8 @@ import math
 import numpy as np
 import matplotlib.pyplot as plt
 import torch.nn as nn
+from PIL import Image 
+
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Decay the learning rate with half-cycle cosine after warmup"""
@@ -57,20 +60,16 @@ def sample_order(bsz, seq_len, device):
     orders = torch.tensor(np.array(orders), device=device)
     return orders
     
-def save_checkpoint(path, mae, denoiser, optimizer):
+def save_checkpoint(path, mae, denoiser, optimizer, mae_ema_params, denoiser_ema_params):
     torch.save({
         "mae_state_dict": mae.state_dict(),
         "denoising_state_dict": denoiser.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict()
+        "optimizer_state_dict": optimizer.state_dict(),
+        "ema_params_mae" : mae_ema_params,
+        "ema_params_denoising_mlp" : denoiser_ema_params
     }, path)
 
-def load_checkpoint(path, mae, denoiser, optimizer):
-    checkpoint = torch.load(path)
-    mae.load_state_dict(checkpoint["mae_state_dict"])
-    denoiser.load_state_dict(checkpoint["denoising_state_dict"])
-    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-
-def save_img_as_fig(x, filename, path="./output", size=256):
+def save_img_as_fig(x, filename, path="./output", size=32):
     with torch.no_grad():
         x = (x + 1) / 2
         gen_img = np.clip(x[0].float().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8)
@@ -174,3 +173,30 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+def center_crop_arr(pil_image, image_size):
+    """
+    Center cropping implementation from ADM.
+    https://github.com/openai/guided-diffusion/blob/8fb3ad9197f16bbc40620447b2742e13458d2831/guided_diffusion/image_datasets.py#L126
+    """
+    while min(*pil_image.size) >= 2 * image_size:
+        pil_image = pil_image.resize(
+            tuple(x // 2 for x in pil_image.size), resample=Image.BOX
+        )
+
+    scale = image_size / min(*pil_image.size)
+    pil_image = pil_image.resize(
+        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+    )
+
+    arr = np.array(pil_image)
+    crop_y = (arr.shape[0] - image_size) // 2
+    crop_x = (arr.shape[1] - image_size) // 2
+    return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+def write_csv(name, path, list):
+    csv_file = os.path.join(path, name)
+    with open(csv_file, "w", newline="") as f:
+        writer = csv.writer(f)
+        for item in list:
+            writer.writerow([item])

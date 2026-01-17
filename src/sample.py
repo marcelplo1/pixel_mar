@@ -16,8 +16,9 @@ def sample(args, mae, denoiser, labels, device):
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     bsz = args.gen_batch_size
-    seq_len = (args.img_size // args.patch_size) ** 2
-    embed_dim = (args.patch_size ** 2) * args.channels
+    patch_size = mae.patch_size
+    seq_len = (args.img_size // patch_size) ** 2
+    embed_dim = (patch_size ** 2) * args.channels
 
     tokens = torch.zeros(bsz, seq_len, embed_dim, device=device)
     mask = torch.ones(bsz, seq_len, device=device)
@@ -25,7 +26,7 @@ def sample(args, mae, denoiser, labels, device):
 
     ar_steps = args.num_ar_steps
     for i in range(ar_steps):
-        z = mae(tokens, mask, labels)
+        z, _ = mae(tokens, mask, labels)
 
         mask_ratio = np.cos(math.pi / 2. * (i + 1) / ar_steps)
         mask_len = torch.Tensor([np.floor(seq_len * mask_ratio)]).to(device)
@@ -39,18 +40,17 @@ def sample(args, mae, denoiser, labels, device):
         mask = mask_next
 
         z = z[mask_to_pred.nonzero(as_tuple=True)]
+        
+        xt_mask = args.noise_scale * torch.randn(z.shape[0], embed_dim).cuda()
 
-        new_bsz = z.shape[0]
-        xt = args.noise_scale * torch.randn(new_bsz, embed_dim, device=device)
-
-        sampled_x = denoiser.generate(xt, z)
+        sampled_x = denoiser.generate(xt_mask, z)
 
         tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_x
         if args.is_debug and local_rank == 0:
             folder = os.path.join(args.output_dir, "ar_generation_steps")
-            save_img_as_fig(unpatchify(tokens.reshape(tokens.shape[0], tokens.shape[1], -1), args.patch_size, seq_len, args.channels), filename="sampling_step_{}.png".format(i), path=folder)
+            save_img_as_fig(unpatchify(tokens.reshape(tokens.shape[0], tokens.shape[1], -1), patch_size, seq_len, args.channels), filename="sampling_step_{}.png".format(i), path=folder)
 
-    img = unpatchify(tokens, args.patch_size, seq_len, channels=args.channels)
+    img = unpatchify(tokens, patch_size, seq_len, channels=args.channels)
     
     return img
 
