@@ -30,25 +30,25 @@ class Denoiser(nn.Module):
         self.steps = args.num_timesteps
 
         self.channels = args.channels
-        self.is_debug = args.is_debug
+        self.use_logging = args.use_logging
         self.output_dir = args.output_dir
 
         self.pred_type = args.pred_type
         self.ema_decay = args.ema_decay
 
-        self.diffusion_batch_mul = 4
+        self.diffusion_batch_mul = args.diffusion_batch_mult
         self.log_counter = 0
+        self.log_batch_pred = 100
 
     def sample_t(self, n: int, device=None):  # lognormal distribution
-        #t = torch.randn(n, device=device) * self.P_std + self.P_mean
-        t = torch.randn(n, device=device)
+        t = torch.randn(n, device=device) * self.P_std + self.P_mean
         return torch.sigmoid(t)
 
-    def forward(self, x, z, mask):
-
+    def forward(self, x, z, mask, labels):
         B, N, D = x.shape
         x = x.view(B*N, -1).repeat(self.diffusion_batch_mul, 1)
         z = z.reshape(B*N, -1).repeat(self.diffusion_batch_mul, 1)
+        labels = labels.repeat(self.diffusion_batch_mul*N)
         mask = mask.reshape(B*N).repeat(self.diffusion_batch_mul)
 
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
@@ -57,7 +57,7 @@ class Denoiser(nn.Module):
         xt = t * x + (1 - t) * e
         v = (x - xt) / (1 - t).clamp_min(self.t_eps)
 
-        pred = self.denoising_net(xt, z, t.flatten())
+        pred = self.denoising_net(xt, z, t.flatten(), labels)
 
         if self.pred_type == 'x':
             v_pred = (pred - xt) / (1 - t).clamp_min(self.t_eps)
@@ -77,7 +77,7 @@ class Denoiser(nn.Module):
             loss = (loss * mask).sum() / (mask.sum() * D)
 
         self.log_counter += 1
-        if self.is_debug and dist.get_rank() == 0 and self.log_counter % 100 == 0:
+        if self.use_logging and dist.get_rank() == 0 and self.log_counter % self.log_batch_pred == 0:
             self.log_counter = 0
             time_step = round(t[0].item(), 1)
 
@@ -88,24 +88,30 @@ class Denoiser(nn.Module):
             
             error_vis = torch.abs(x_vis - x_pred_vis)
 
-            #x_pred_vis *= mask_vis
+            x_pred_vis[(mask_vis==0).expand_as(x_pred_vis)] = -1.0
 
-            save_img_as_fig(unpatchify(x_vis, self.denoising_net.patch_size, N, self.channels), 
-                            filename="ground_truth_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
+
+            folder = os.path.join(self.output_dir, "last_training_predictions")
+            os.makedirs(folder, exist_ok=True)
+
+            x_path =  os.path.join(folder, "ground_truth_t={}.png".format(time_step))
+            save_img_as_fig(unpatchify(x_vis, self.denoising_net.patch_size, self.channels), 
+                            file_path=x_path, size=self.img_size)
             
-            save_img_as_fig(unpatchify(x_pred_vis, self.denoising_net.patch_size, N, self.channels), 
-                            filename="prediction_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
+            x_pred_path = os.path.join(folder, "prediction_t={}.png".format(time_step))
+            save_img_as_fig(unpatchify(x_pred_vis, self.denoising_net.patch_size, self.channels), 
+                            file_path=x_pred_path.format(time_step), size=self.img_size)
 
-            save_img_as_fig(unpatchify(v_pred_vis, self.denoising_net.patch_size, N, self.channels), 
-                            filename="velocity_field_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
+            # save_img_as_fig(unpatchify(v_pred_vis, self.denoising_net.patch_size, N, self.channels), 
+            #                 filename="velocity_field_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
 
-            save_img_as_fig(unpatchify(error_vis, self.denoising_net.patch_size, N, self.channels), 
-                            filename="error_map_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
+            # save_img_as_fig(unpatchify(error_vis, self.denoising_net.patch_size, N, self.channels), 
+            #                 filename="error_map_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
 
         return loss
 
     @torch.no_grad()
-    def generate(self, xt, z):
+    def generate(self, xt, z, labels):
         device = z.device
         bsz = xt.size(0)
         timesteps = torch.linspace(self.t_eps, 1.0 - self.t_eps, self.steps+1, device=device)
@@ -119,37 +125,37 @@ class Denoiser(nn.Module):
             raise NotImplementedError
 
         # ode
-        for i in range(self.steps):
+        for i in range(self.steps-1):
             t = timesteps[i]
             t_next = timesteps[i + 1]
-            xt = stepper(xt, z, t, t_next)
+            xt = stepper(xt, z, t, t_next, labels)
             # TODO Log each noisy step
+        xt = self._euler_step(xt, z, timesteps[-2], timesteps[-1], labels)
         return xt
 
     @torch.no_grad()
-    def _forward_sample(self, xt, z, t):
-        pred = self.denoising_net(xt, z, t.view(-1))
+    def _forward_sample(self, xt, z, t, labels):
+        pred = self.denoising_net(xt, z, t.view(-1), labels)
         if self.pred_type == 'v':
             v_pred = pred
         elif self.pred_type == 'x':
-            pred = torch.clamp(pred, -1.0, 1.0) #TODO
             v_pred = (pred - xt) / (1.0 - t).clamp_min(self.t_eps)
         elif self.pred_type == 'e':
             v_pred = (xt - pred) / (t).clamp_min(self.t_eps)
         return v_pred
 
     @torch.no_grad()
-    def _euler_step(self, xt, z, t, t_next):
-        v_pred = self._forward_sample(xt, z, t)
+    def _euler_step(self, xt, z, t, t_next, labels):
+        v_pred = self._forward_sample(xt, z, t, labels)
         xt_next = xt + (t_next - t) * v_pred
         return xt_next
 
     @torch.no_grad()
-    def _heun_step(self, xt, z, t, t_next):
+    def _heun_step(self, xt, z, t, t_next, labels):
         v_pred_t = self._forward_sample(xt, z, t)
 
         xt_next_euler = xt + (t_next - t) * v_pred_t
-        v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next)
+        v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next, labels)
 
         v_pred = 0.5 * (v_pred_t + v_pred_t_next)
         xt_next = xt + (t_next - t) * v_pred

@@ -7,12 +7,11 @@ import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torchvision import datasets, transforms
-from PIL import Image
 import torch.distributed as dist
 import copy
 
 from denoiser import Denoiser
-from model.denoising_model import DenoisingMLP
+from model.denoising_model_context import DenoisingMLP
 from model.mae import MAE
 from utils import ddp
 from utils.utils import center_crop_arr, save_checkpoint, save_plot, write_csv
@@ -22,23 +21,22 @@ from utils.wandb_utils import initialize_wandb
 
 def create_parser():
     parser = argparse.ArgumentParser(description="Argument Parser for toy example")
-    parser.add_argument("--is_debug", action="store_true", help="Enable debug mode")
+    parser.add_argument("--use_logging", action="store_true", help="Enable debug mode")
     parser.add_argument("--img_size", type=int, default=64, help="Image size (assumed square)")
     parser.add_argument("--output_dir", type=str, default="./output/debug", help="Directory to save outputs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--pred_type", type=str, default="v", help="Prediction type for the diffusion", choices=["x", "eps", "v"])
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
-    parser.add_argument("--checkpoint_path", type=str, default="./output/cifar10_64px_x_pred_v2/checkpoint_100.pt", help="Loading path for checkpoint")
-    parser.add_argument("--t_eps", type=float, default=5e-2, help="Epsilon value for time sampling in diffusion")
-    parser.add_argument("--activate_ema", action="store_true", help="Use exponential moving average for the model parameters")
-    parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
+    parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
+    parser.add_argument("--t_eps", type=float, default=1e-2, help="Epsilon value for time sampling in diffusion")
+    parser.add_argument("--remove_ema", action="store_true", help="Use exponential moving average for the model parameters")
     parser.add_argument('--ema_decay', default=0.9999, type=float, help='EMA decay for the parameter update')
-    parser.add_argument("--model", type=str, default="pixelMAR-S-04", help="Specify the model")
+    parser.add_argument("--model", type=str, default="pixelMAR-B-04", help="Specify the model")
 
     # Training
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size for training")
+    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1000, help="Training epochs")
-    parser.add_argument("--warmup_epochs", type=int, default=5, help="Number of warmup epochs")
+    parser.add_argument("--warmup_epochs", type=int, default=50, help="Number of warmup epochs")
     parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
     parser.add_argument("--min_mask_rate", type=float, default=0.7, help="Minimum mask rate")
     parser.add_argument("--noise_scale", type=float, default=1.0, help="Noise scale for diffusion")
@@ -46,30 +44,30 @@ def create_parser():
     parser.add_argument('--P_std', default=0.8, type=float, help='std for the normal distribution for time sampling')
     parser.add_argument('--weight_decay', default=0.0, type=float, help='Weight decay for the optimizer')
     parser.add_argument("--save_freq", type=int, default=50, help="Frequency of saving the checkpoint")
+    parser.add_argument("--diffusion_batch_mult", type=int, default=4, help="Multiplicate the number of diffusion steps for each train step")
 
     # Sampling 
-    parser.add_argument("--gen_batch_size", type=int, default=512, help="Batch size for sampling")
+    parser.add_argument("--gen_batch_size", type=int, default=16, help="Batch size for sampling")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate the model after training")
-    parser.add_argument("--num_images", type=int, default=10000, help="Number of images to generate during evaluation")
-    parser.add_argument("--num_ar_steps", type=int, default=8, help="Number of sampling steps during evaluation")
+    parser.add_argument("--num_images", type=int, default=50000, help="Number of images to generate during evaluation")
+    parser.add_argument("--num_ar_steps", type=int, default=16, help="Number of sampling steps during evaluation")
     parser.add_argument("--num_timesteps", type=int, default=50, help="Number of timesteps for diffusion process during sampling")
     parser.add_argument("--online_eval_freq", type=int, default=25, help="Frequency of online evaluation during training")
     parser.add_argument("--sampling_method", type=str, default="euler", help="Sampling method to use", choices=["euler", "heun"])
-    parser.add_argument("--sampled_img_size", type=int, default=64, help="Size of generated images during evaluation")
 
     # Dataset
-    parser.add_argument("--dataset", type=str, default="cifar10", help="Dataset to use", choices=["mnist", "cifar10", "imagenet100", "single"])
-    parser.add_argument("--class_num", type=int, default=10, help="Number of classes in the dataset")
+    parser.add_argument("--class_num", type=int, default=1000, help="Number of classes in the dataset")
     parser.add_argument("--has_fixed_target_class", action="store_true", help="Whether to use a fixed target class for training")
     parser.add_argument("--fixed_target_class", type=int, default=0, help="Fix the target class to train on")
     parser.add_argument("--channels", type=int, default=3, help="Number of image channels")
-    parser.add_argument("--imagnet_path", type=str, default="/mnt/lustre/work/geiger/gwb012/marcel/data/imagenet_subset/train", help="Path to ImageNet dataset")
-    parser.add_argument("--data_path", type=str, default="/mnt/lustre/work/geiger/gwb012/marcel/data/imagenet_subset", help="Path to the imagenet train dataset")
+    parser.add_argument("--data_path", type=str, default="./data/imagenet", help="Path to the imagenet train dataset")
+    parser.add_argument("--fid_statistics", action="store_true", help="Use online FID calculation")
+    parser.add_argument("--fid_statistics_path", type=str, default="./fid_stats/adm_in256_stats_full.npz", help="Path to fid statistic file")
 
     # Wandb
+    parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_entity", type=str, default="tuebingen_diffusion")
     parser.add_argument("--wandb_project", type=str, default="tuebingen_diffusion")
-
 
     return parser
 
@@ -87,48 +85,33 @@ def main():
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
-    if args.use_wandb and global_rank == 0:
+    if args.use_wandb and global_rank == 0 and not args.evaluate:
         now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        exp_name = f"{args.model}_{args.dataset}_{args.pred_type}-prediction_{now}"   
+        exp_name = f"{args.model}_{args.img_size}px_{args.pred_type}-prediction_{now}"   
         initialize_wandb(args, 
                         entity=args.wandb_entity, 
                         exp_name=exp_name,
                         project_name=args.wandb_project
         )
 
-    if args.dataset == 'mnist':
-        transform = transforms.Compose([
-            transforms.ToTensor(), 
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-        ])
-    else:
-        transform = transforms.Compose([
-            transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(), 
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-        ])
+    transform = transforms.Compose([
+        transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(), 
+        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+    ])
 
-    if args.dataset == "mnist":
-        if args.img_size == 64:
-            dataset = datasets.ImageFolder(root='./data/mnist-64', transform=transform)
-        elif args.img_size == 28:
-            dataset = datasets.MNIST(root="./data", train=True, download=True, transform=transform)
-        else:
-            return
-    elif args.dataset == "cifar10":
-        if args.img_size == 64:
-            dataset = datasets.ImageFolder(root='./data/cifar10-64', transform=transform)
-        elif args.img_size == 28:
-            dataset = datasets.CIFAR10(root="./data", train=True, download=True, transform=transform)
-        else:
-            return
-    elif args.dataset == 'imagenet100':
-        dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
+    dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
 
     if args.has_fixed_target_class:
-        indices = [i for i in range(len(dataset)) if dataset[i][1] == args.fixed_target_class]
+        targets = torch.tensor(dataset.targets)
+        indices = (targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
         dataset = Subset(dataset, indices)
+        if len(dataset) == 0:
+            print("Fixed dataset class not found!")
+            return
+         
+        print(f"Filtered dataset to class {args.fixed_target_class}. New size: {len(dataset)}")
     
     sampler_train = torch.utils.data.DistributedSampler(
         dataset, num_replicas=world_size, rank=global_rank, shuffle=True
@@ -173,13 +156,13 @@ def main():
         mae_single.ema_params = copy.deepcopy(list(mae.parameters()))
         denoiser_single.ema_params = copy.deepcopy(list(denoiser.parameters()))
 
+    metrics = {k: [] for k in ['loss', 'fid', 'is', 'precision', 'recall']}
     if args.evaluate:
         print("Starting sampling...")
-        evaluate(args, mae_single, denoiser_single, device, epoch=None, global_rank=global_rank)
+        evaluate(args, mae_single, denoiser_single, device, epoch=None, metrics=metrics)
         return
 
     print("Starting training...")
-    metrics = {k: [] for k in ['loss', 'fid', 'is', 'precision', 'recall']}
     for epoch in range(args.epochs):
         if args.distributed:
             dataloader.sampler.set_epoch(epoch)
@@ -193,8 +176,7 @@ def main():
 
         if int(epoch) % args.online_eval_freq == 0:
             print("Starting online evaluation...")
-            evaluate(args, mae_single, denoiser_single, device, epoch=epoch, global_rank=global_rank, 
-                     metrics=metrics)
+            evaluate(args, mae_single, denoiser_single, device, epoch=epoch, metrics=metrics)
 
         if global_rank == 0:
             if int(epoch) % args.save_freq == 0:
@@ -229,26 +211,18 @@ def main():
             denoiser_ema_params=denoiser_single.ema_params
         )
 
-
-def pixel_mar_XS_04(**kwargs):
-    patch_size = 4
-    mae = MAE(hidden_dim=256, depth=6, bottleneck_dim=256, mlp_ratio=4.0, patch_size=patch_size, **kwargs)
-    denoisingMLP = DenoisingMLP(hidden_dim=512, depth=6, final_bottleneck_dim=512, patch_size=patch_size, 
-                                mae_hidden_dim=256, **kwargs)
-    return mae, denoisingMLP
-
 def pixel_mar_S_04(**kwargs):
     patch_size = 4
-    mae = MAE(hidden_dim=512, depth=12, bottleneck_dim=512, mlp_ratio=4.0, patch_size=patch_size, **kwargs)
+    mae = MAE(hidden_dim=512, depth=6, bottleneck_dim=512, mlp_ratio=4.0, patch_size=patch_size, **kwargs)
     denoisingMLP = DenoisingMLP(hidden_dim=768, depth=6, final_bottleneck_dim=768, patch_size=patch_size, 
                                 mae_hidden_dim=512, **kwargs)
     return mae, denoisingMLP
 
 def pixel_mar_B_04(**kwargs):
     patch_size = 4
-    mae = MAE(hidden_dim=512, depth=12, bottleneck_dim=512, mlp_ratio=4.0, patch_size=patch_size, **kwargs)
+    mae = MAE(hidden_dim=768, depth=12, bottleneck_dim=768, mlp_ratio=4.0, patch_size=patch_size, **kwargs)
     denoisingMLP = DenoisingMLP(hidden_dim=1024, depth=6, final_bottleneck_dim=1024, patch_size=patch_size, 
-                                mae_hidden_dim=512, **kwargs)
+                                mae_hidden_dim=768, **kwargs)
     return mae, denoisingMLP
 
 def pixel_mar_B_16(**kwargs):
@@ -259,7 +233,6 @@ def pixel_mar_B_16(**kwargs):
     return mae, denoisingMLP
 
 pixelMAR_models = {
-    'pixelMAR-XS-04' : pixel_mar_XS_04,   
     'pixelMAR-S-04' : pixel_mar_S_04,
     'pixelMAR-B-04' : pixel_mar_B_04,
     'pixelMAR-B-16' : pixel_mar_B_16

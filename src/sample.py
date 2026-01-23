@@ -26,7 +26,8 @@ def sample(args, mae, denoiser, labels, device):
 
     ar_steps = args.num_ar_steps
     for i in range(ar_steps):
-        z, _ = mae(tokens, mask, labels)
+        cur_tokens = tokens.clone()
+        z = mae(tokens, mask, labels)
 
         mask_ratio = np.cos(math.pi / 2. * (i + 1) / ar_steps)
         mask_len = torch.Tensor([np.floor(seq_len * mask_ratio)]).to(device)
@@ -40,17 +41,21 @@ def sample(args, mae, denoiser, labels, device):
         mask = mask_next
 
         z = z[mask_to_pred.nonzero(as_tuple=True)]
-        
         xt_mask = args.noise_scale * torch.randn(z.shape[0], embed_dim).cuda()
+        y = labels.repeat(z.shape[0] // bsz)
 
-        sampled_x = denoiser.generate(xt_mask, z)
+        sampled_x = denoiser.generate(xt_mask, z, y)
 
-        tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_x
-        if args.is_debug and local_rank == 0:
+        cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_x
+        tokens = cur_tokens.clone()
+
+        if args.use_logging and local_rank == 0:
             folder = os.path.join(args.output_dir, "ar_generation_steps")
-            save_img_as_fig(unpatchify(tokens.reshape(tokens.shape[0], tokens.shape[1], -1), patch_size, seq_len, args.channels), filename="sampling_step_{}.png".format(i), path=folder)
+            os.makedirs(folder, exist_ok=True)
+            file_path = os.path.join(folder, "sampling_step_{}.png".format(i))
+            save_img_as_fig(unpatchify(tokens.reshape(tokens.shape[0], tokens.shape[1], -1), patch_size, args.channels), file_path=file_path, size=args.img_size)
 
-    img = unpatchify(tokens, patch_size, seq_len, channels=args.channels)
+    img = unpatchify(tokens, patch_size, channels=args.channels)
     
     return img
 

@@ -14,8 +14,9 @@ venv/
 env/
 *.egg-info/
 
-# Ignore dataset files
+# Ignore dataset and logging files
 data/*
+wandb/*
 
 # VSCode settings
 .vscode/

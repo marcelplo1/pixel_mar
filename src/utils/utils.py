@@ -30,26 +30,33 @@ def adjust_learning_rate(optimizer, epoch, args):
             param_group["lr"] = lr
     return lr
 
-def patchify(x, patch_size):
+def patchify(x, p):
+    """
+    x: (B, C, H, W)
+    x: (B, N, patch_size**2 * C)
+    """
     bsz, c, h, w = x.shape
-    p = patch_size
     h_, w_ = h // p, w // p
 
     x = x.reshape(bsz, c, h_, p, w_, p)
     x = torch.einsum('nchpwq->nhwcpq', x)
     x = x.reshape(bsz, h_ * w_, c * p ** 2)
-    return x  # [n, l, d]
+    return x  # [B, N, D]
 
-def unpatchify(x, patch_size, seq_len, channels=3):
-    bsz = x.shape[0]
-    p = patch_size
+def unpatchify(x, p, channels=3):
+    """
+    x: (B, N, patch_size**2 * C)
+    imgs: (B, C, H, W)
+    """
+    bsz, n, d = x.shape
     c = channels
-    h_, w_ = int(math.sqrt(seq_len)), int(math.sqrt(seq_len))
+    h = w = int(n ** 0.5)
+    assert h * w == n
 
-    x = x.reshape(bsz, h_, w_, c, p, p)
+    x = x.reshape(shape=(bsz, h, w, c, p, p))
     x = torch.einsum('nhwcpq->nchpwq', x)
-    x = x.reshape(bsz, c, h_ * p, w_ * p)
-    return x  # [n, c, h, w]
+    imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
+    return imgs
 
 def sample_order(bsz, seq_len, device):
     orders = []
@@ -69,13 +76,12 @@ def save_checkpoint(path, mae, denoiser, optimizer, mae_ema_params, denoiser_ema
         "ema_params_denoising_mlp" : denoiser_ema_params
     }, path)
 
-def save_img_as_fig(x, filename, path="./output", size=32):
+def save_img_as_fig(x, file_path, size=32):
     with torch.no_grad():
         x = (x + 1) / 2
         gen_img = np.clip(x[0].float().cpu().numpy().transpose(1, 2, 0) * 255, 0, 255).astype(np.uint8)
     gen_img = cv2.resize(gen_img, (size, size), interpolation=cv2.INTER_LINEAR)
-    os.makedirs(path, exist_ok=True)
-    cv2.imwrite(os.path.join(path, filename), gen_img[:, :, ::-1])
+    cv2.imwrite(file_path, gen_img[:, :, ::-1])
 
 def save_multiple_imgs_as_fig(imgs, patch_size, filename, path="./output"):
     bsz = imgs.shape[0]

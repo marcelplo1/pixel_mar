@@ -36,12 +36,13 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         labels = labels.to(device, non_blocking=True)
 
         x = patchify(samples, mae_single.patch_size)
+        x_gt = x.clone().detach()
         orders = sample_order(x.shape[0], x.shape[1], device)
         mask = random_masking(x, orders, args.min_mask_rate)
 
-        z, masked_x = mae(x, mask, labels)
+        z = mae(x, mask, labels)
         
-        loss = denoiser(x, z, mask)
+        loss = denoiser(x_gt, z, mask, labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -62,26 +63,27 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
 
         losses.append(loss.item())
 
-        # if args.is_debug and global_rank == 0:
-        #     save_img_as_fig(unpatchify(masked_x, args.patch_size, x.shape[1], args.channels), filename="mask.png", path=args.output_dir)
-
     return losses
 
-def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, metrics=None):
+def evaluate(args, mae, denoiser, device, epoch=None, metrics=None):
     mae.eval()
     denoiser.eval()
 
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
-    save_folder_fid = os.path.join(args.output_dir, "generation_{}_fid".format(args.dataset))
-    class_folder = os.path.join(args.output_dir, "generation_{}".format(args.dataset), 'epoch{}'.format(epoch))
+    if epoch is not None:
+        save_folder_fid = os.path.join(args.output_dir, "train_fid_samples")
+        class_folder = os.path.join(args.output_dir, "train_class_samples", 'epoch{}'.format(epoch))
+    else:
+        save_folder_fid = os.path.join(args.output_dir, "eval_fid_samples")
+        class_folder = os.path.join(args.output_dir, "eval_class_samples", 'epoch{}'.format(epoch))
 
     if local_rank == 0: 
         os.makedirs(class_folder, exist_ok=True)
         os.makedirs(save_folder_fid, exist_ok=True)
 
-    if args.activate_ema: 
+    if args.remove_ema == False: 
         mae_state_dict = copy.deepcopy(mae.state_dict())
         mae_ema_state_dict = copy.deepcopy(mae.state_dict())
         for i, (name, _value) in enumerate(mae.named_parameters()):
@@ -99,12 +101,15 @@ def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, metrics=Non
         denoiser.load_state_dict(denoiser_ema_state_dict)
 
     assert args.num_images % args.class_num == 0, "Number of images per class must be the same"
-    class_label_gen_world = np.arange(0, args.class_num).repeat(args.num_images // args.class_num)
+    if args.has_fixed_target_class:
+        class_label_gen_world = np.full((args.class_num,), args.fixed_target_class)
+    else:
+        class_label_gen_world = np.arange(0, args.class_num).repeat(args.num_images // args.class_num)
     class_label_gen_world = np.hstack([class_label_gen_world, np.zeros(50000)])
 
     num_steps = args.num_images // (args.gen_batch_size * world_size) + 1
     bsz = args.gen_batch_size
-    saved_one_per_class = {c: False for c in range(args.class_num)}
+    images_per_class = {c: 0 for c in range(args.class_num)}
     for step in range(num_steps):
         start_idx = world_size * bsz * step + local_rank * bsz
         end_idx = start_idx + bsz
@@ -121,96 +126,77 @@ def evaluate(args, mae, denoiser, device, epoch=None, global_rank=0, metrics=Non
             img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
             if img_id >= args.num_images:
                 break
-            resize = transforms.Resize((args.sampled_img_size, args.sampled_img_size), interpolation=transforms.InterpolationMode.BILINEAR)
-            #img_down = resize(sampled_images[b_id])
-            img_down = sampled_images[b_id] # TODO
-            gen_img = np.round(np.clip(img_down.numpy().transpose([1, 2, 0]) * 255, 0, 255))
+            gen_img = np.round(np.clip( sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
 
             cls = int(labels_gen[b_id].item())
-            
-            if cls < args.class_num and local_rank == 0 and not saved_one_per_class[cls]:
-                class_filename = f'sample_class_{cls}_rank_{local_rank}.png'
-                cv2.imwrite(os.path.join(class_folder, class_filename), gen_img)
-                saved_one_per_class[cls] = True
+            num_samples = (10 // world_size) + (1 if local_rank < (10 % world_size) else 0)
+            if cls < args.class_num and images_per_class[cls] < num_samples:
+                class_filename = f'sample_class_{cls}_rank_{local_rank}_sample_{images_per_class[cls]}.png'
+                save_path = os.path.join(class_folder, class_filename)
+                if not os.path.exists(save_path):
+                    cv2.imwrite(save_path, gen_img)
+                    images_per_class[cls] += 1
 
     torch.distributed.barrier()
 
-    if args.activate_ema:
+    if args.remove_ema == False:
         print("Switch back from ema")
         mae.load_state_dict(mae_state_dict)
         denoiser.load_state_dict(denoiser_state_dict)
 
     # Evaluate the generation quality
-    isc = False
-    fid = False
-    kid = False
-    prc = False
-    if args.dataset == 'imagenet100':
-        input2 = None
-        fid_statistics_file = 'fid_stats/adm_in256_stats.npz'
-        fid = True
+    if args.fid_statistics:
         isc = True
-    elif args.dataset == 'cifar10':
-        input2 = None
-        if args.sampled_img_size == 32:
-            fid_statistics_file = 'fid_stats/adm_cifar10-32_fid_stats.npz'
-        elif args.sampled_img_size == 64:
-            fid_statistics_file = 'fid_stats/adm_cifar10-64_fid_stats.npz'
-        else:
+        fid = True
+        kid = False
+        prc = False
+        if os.path.exists(args.fid_statistics_path) == False:
+            print("Statistic path does not exits! ")
             return
-        fid = True
-        isc = True
-    elif args.dataset == 'mnist':
-        input2 = None
-        fid_statistics_file = 'fid_stats/adm_mnist-64_fid_stats.npz'
-        fid = True
-        isc = True
-    else:
-        return
-    metrics_dict = torch_fidelity.calculate_metrics(
-        input1=save_folder_fid,
-        input2=input2,
-        fid_statistics_file=fid_statistics_file,
-        cuda=True,
-        isc=isc,
-        fid=fid,
-        kid=kid,
-        prc=prc,
-        verbose=False
-    )
-    if fid:
-        fid_score = metrics_dict['frechet_inception_distance']
-        print("FID: {:.4f}".format(fid_score))
-        if metrics['fid'] is not None:
-            metrics['fid'].append(fid_score)
-    if isc:
-        inception_score = metrics_dict['inception_score_mean']
-        print("Inception Score: {:.4f}".format(inception_score))
-        if metrics['is'] is not None:
-            metrics['is'].append(inception_score)
-    if kid:
-        kid_score = metrics_dict['kernel_inception_distance_mean']
-        print("KID: {:.4f}".format(kid_score))
-    if prc:
-        precision = metrics_dict['precision']
-        recall = metrics_dict['recall']
-        print("Precision: {:.4f}".format(precision))
-        print("Recall: {:.4f}".format(recall))      
-        if metrics['precision'] is not None:
-            metrics['precision'].append(precision)
-        if metrics['recall'] is not None:
-            metrics['recall'].append(recall)
+        metrics_dict = torch_fidelity.calculate_metrics(
+            input1=save_folder_fid,
+            input2=None,
+            fid_statistics_file=args.fid_statistics_path,
+            cuda=True,
+            isc=isc,
+            fid=fid,
+            kid=kid,
+            prc=prc,
+            verbose=False
+        )
+        if fid:
+            fid_score = metrics_dict['frechet_inception_distance']
+            print("FID: {:.4f}".format(fid_score))
+            if metrics['fid'] is not None:
+                metrics['fid'].append(fid_score)
+        if isc:
+            inception_score = metrics_dict['inception_score_mean']
+            print("Inception Score: {:.4f}".format(inception_score))
+            if metrics['is'] is not None:
+                metrics['is'].append(inception_score)
+        if kid:
+            kid_score = metrics_dict['kernel_inception_distance_mean']
+            print("KID: {:.4f}".format(kid_score))
+        if prc:
+            precision = metrics_dict['precision']
+            recall = metrics_dict['recall']
+            print("Precision: {:.4f}".format(precision))
+            print("Recall: {:.4f}".format(recall))      
+            if metrics['precision'] is not None:
+                metrics['precision'].append(precision)
+            if metrics['recall'] is not None:
+                metrics['recall'].append(recall)
 
-    torch.distributed.barrier()
-    
-    if local_rank == 0:
-        if args.use_wandb:
-            stats = {
-                "evaluate/fid": fid_score,
-                "evaluate/is": inception_score,
-                "epoch" : epoch
-            }
-            log(stats)
-        shutil.rmtree(save_folder_fid)
+        torch.distributed.barrier()
+        
+        if local_rank == 0:
+            if args.use_wandb and epoch is not None:
+                stats = {
+                    "evaluate/fid": fid_score,
+                    "evaluate/is": inception_score,
+                    "epoch" : epoch
+                }
+                log(stats)
+            shutil.rmtree(save_folder_fid)
