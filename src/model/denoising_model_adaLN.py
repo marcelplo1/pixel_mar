@@ -11,7 +11,7 @@ class FinalLayer(nn.Module):
     """
     The final layer with a possible bottleneck layer
     """
-    def __init__(self, hidden_dim, patch_size, out_channels, bottleneck_dim=64):
+    def __init__(self, hidden_dim, patch_size, out_channels):
         super().__init__()
         self.norm_final = RMSNorm(hidden_dim)
         self.linear = nn.Linear(hidden_dim, patch_size * patch_size * out_channels, bias=True)
@@ -57,36 +57,30 @@ class ResBlock(nn.Module):
         return x + gate_mlp * h
         #return gate_mlp * h
 
-class DenoisingMLP(nn.Module):
+class DenoisingModel(nn.Module):
     """
     The diffusion model
     """
     def __init__(
         self,
         img_size=256,
+        patch_size=16,
         channels=3,
         num_classes=10,
         hidden_dim=768,
-        mae_hidden_dim=768,
-        patch_size=16,
         depth=6,
-        final_bottleneck_dim=64,
-        ema_decay=0.999
+        dropout=0.0,
+        z_hidden_dim=768,
     ):
         super().__init__()
-        self.in_channels = channels
-        self.out_channels = channels
-        self.patch_size = patch_size
-        self.hidden_dim = hidden_dim
-        self.img_size = img_size
+ 
         self.num_classes = num_classes
-
         self.embedding_dim = channels * patch_size**2
         self.num_patches = (img_size // patch_size) ** 2
 
         self.input_proj = nn.Linear(self.embedding_dim, hidden_dim)
         self.t_embedder = TimestepEmbedder(hidden_dim)
-        self.c_token_proj = nn.Linear(mae_hidden_dim, hidden_dim)
+        self.c_token_proj = nn.Linear(z_hidden_dim, hidden_dim)
 
         self.blocks = nn.ModuleList([
             ResBlock(hidden_dim, self.embedding_dim)
@@ -94,7 +88,7 @@ class DenoisingMLP(nn.Module):
         ])
 
         # linear predict with bottleneck layer
-        self.final_layer = FinalLayer(hidden_dim, patch_size, self.out_channels, final_bottleneck_dim)
+        self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
 
         self.initialize_weights()
         #self.initialize_weights_wo_residual()

@@ -66,15 +66,6 @@ def sample_order(bsz, seq_len, device):
         orders.append(order)
     orders = torch.tensor(np.array(orders), device=device)
     return orders
-    
-def save_checkpoint(path, mae, denoiser, optimizer, mae_ema_params, denoiser_ema_params):
-    torch.save({
-        "mae_state_dict": mae.state_dict(),
-        "denoising_state_dict": denoiser.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "ema_params_mae" : mae_ema_params,
-        "ema_params_denoising_mlp" : denoiser_ema_params
-    }, path)
 
 def save_img_as_fig(x, file_path, size=32):
     with torch.no_grad():

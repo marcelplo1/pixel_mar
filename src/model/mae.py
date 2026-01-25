@@ -12,23 +12,26 @@ class MAE(nn.Module):
             img_size, 
             patch_size=16, 
             channels=3, 
-            hidden_dim=768, 
-            depth=6, 
+            num_classes=10, 
+            ema_decay=0.9999,
+            encoder_dim=768,
+            decoder_dim=768, 
+            encoder_depth=12,
+            decoder_depth=12, 
+            encoder_num_heads=12,
+            decoder_num_heads=12,
             mlp_ratio=4.0, 
             dropout=0.1, 
-            num_classes=10, 
-            buffer_size=32, 
-            bottleneck_dim=16,
-            ema_decay=0.9999
+            buffer_size=64,
+            min_mask_rate = 0.7
         ):
         super().__init__()
 
-        self.image_size = img_size
         self.patch_size = patch_size
-        self.hidden_dim = hidden_dim
+        self.min_mask_rate = min_mask_rate
         self.buffer_size = buffer_size
-        self.num_classes = num_classes
-
+        self.encoder_dim = encoder_dim
+        self.decoder_dim = decoder_dim
         self.seq_len = (img_size // patch_size) ** 2
         self.embed_dim = channels * patch_size**2
 
@@ -38,25 +41,25 @@ class MAE(nn.Module):
         #     nn.Linear(bottleneck_dim, hidden_dim)
         # )
 
-        self.x_proj = nn.Linear(self.embed_dim, hidden_dim, bias=True)
-        self.x_ln = nn.LayerNorm(hidden_dim, eps=1e-6)
-        self.decoder_embed = nn.Linear(self.hidden_dim, hidden_dim, bias=True)
+        self.x_proj = nn.Linear(self.embed_dim, encoder_dim, bias=True)
+        self.x_ln = nn.LayerNorm(encoder_dim, eps=1e-6)
+        self.decoder_embed = nn.Linear(self.decoder_dim, decoder_dim, bias=True)
 
-        self.mask_token  = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        self.class_emb = nn.Embedding(num_classes, self.hidden_dim)
+        self.mask_token  = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+        self.class_emb = nn.Embedding(num_classes, encoder_dim)
         
-        self.encoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, self.hidden_dim), requires_grad=True)
-        self.decoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, self.hidden_dim),  requires_grad=True)
+        self.encoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_dim), requires_grad=True)
+        self.decoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_dim),  requires_grad=True)
 
         self.encoder_block = nn.ModuleList([
-            Block(hidden_dim, hidden_dim//64, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
-                  proj_drop=dropout, attn_drop=dropout) for _ in range(depth)])
-        self.encoder_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+            Block(encoder_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
+                  proj_drop=dropout, attn_drop=dropout) for _ in range(encoder_depth)])
+        self.encoder_norm = nn.LayerNorm(encoder_dim, eps=1e-6)
 
         self.decoder_block = nn.ModuleList([
-            Block(hidden_dim, hidden_dim//64, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
-                  proj_drop=dropout, attn_drop=dropout) for _ in range(depth)])
-        self.decoder_norm = nn.LayerNorm(hidden_dim, eps=1e-6)
+            Block(decoder_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
+                  proj_drop=dropout, attn_drop=dropout) for _ in range(decoder_depth)])
+        self.decoder_norm = nn.LayerNorm(decoder_dim, eps=1e-6)
 
         #self.label_drop_prob = 0.1
         #self.fake_latent = nn.Parameter(torch.zeros(1, hidden_dim))
@@ -80,11 +83,14 @@ class MAE(nn.Module):
         self.apply(_init_weights)
 
         grid_size = int(self.seq_len ** 0.5)
-        pos_embed_grid = get_2d_sincos_pos_embed(self.hidden_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.hidden_dim)
+        pos_embed_grid = get_2d_sincos_pos_embed(self.encoder_dim, grid_size)
+        full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.encoder_dim)
         full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        
         self.encoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
+
+        pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
+        full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.decoder_dim)
+        full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
         self.decoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
 
         nn.init.trunc_normal_(self.mask_token, std=0.02)
@@ -108,7 +114,7 @@ class MAE(nn.Module):
         x = x + self.encoder_pos_emb
         x = self.x_ln(x)
 
-        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, self.hidden_dim)
+        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, self.encoder_dim)
 
         for block in self.encoder_block:
             x = block(x)

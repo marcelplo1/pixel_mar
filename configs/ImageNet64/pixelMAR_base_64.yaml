@@ -1,0 +1,43 @@
+model:
+  name: pixelMar_base_64
+  params:
+    img_size: 64
+    patch_size: 4
+    in_channels: 3
+    ema_decay: 0.9995
+    t_eps: 1.0e-2
+    sample_t_mean: -0.8
+    sample_t_std: 0.8
+    diffusion_btach_mul: 4
+    pred_type: 'v'  
+  mae_params:
+    encoder_dim: 768
+    encoder_depth: 12
+    encoder_num_heads: 12
+    decoder_dim: 768
+    decoder_depth: 12
+    decoder_num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.1
+    buffer_size: 64
+    mask_ratio_min: 0.7
+  denoiser_params:
+    hidden_dim: 1024
+    depth: 6
+    dropout: 0.1
+
+sampler:
+  method: 'heun'
+  num_ar_steps: 16
+  num_timesteps: 100
+  noise_scale: 1.0
+
+
+
+
+
+
+
+
+
+  

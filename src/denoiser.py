@@ -9,34 +9,42 @@ from utils.utils import save_img_as_fig, unpatchify
 class Denoiser(nn.Module):
     def __init__(
         self,
-        args,
-        denoisingMLP
+        denoising_model,
+        output_dir,
+        sampling_method = 'euler',
+        pred_type = 'v',
+        diffusion_batch_multi=4,
+        num_timesteps = 100,
+        sample_t_mean = 0.0,
+        sample_t_std = 1.0,
+        t_eps = 1e-2,
+        noise_scale = 1.0,
+        ema_decay = 0.9999,
+        use_logging=False
     ):
         super().__init__()
 
-        self.denoising_net = denoisingMLP
+        self.denoising_net = denoising_model
 
-        self.img_size = args.img_size
-        self.num_classes = args.class_num
+        self.img_size = denoising_model.img_size
+        self.channels = denoising_model.in_channels
+        self.patch_size = denoising_model.patch_size
 
-        self.P_mean = args.P_mean
-        self.P_std = args.P_std
-        self.t_eps = args.t_eps
-        self.noise_scale = args.noise_scale
+        self.P_mean = sample_t_mean
+        self.P_std = sample_t_std
+        self.t_eps = t_eps
+        self.noise_scale = noise_scale
+        self.method = sampling_method
+        self.steps = num_timesteps
+
+        self.use_logging = use_logging
+        self.output_dir = output_dir
+
+        self.pred_type = pred_type
+        self.ema_decay = ema_decay
+        self.diffusion_batch_mul = diffusion_batch_multi
 
         self.ema_params = None
-
-        self.method = args.sampling_method
-        self.steps = args.num_timesteps
-
-        self.channels = args.channels
-        self.use_logging = args.use_logging
-        self.output_dir = args.output_dir
-
-        self.pred_type = args.pred_type
-        self.ema_decay = args.ema_decay
-
-        self.diffusion_batch_mul = args.diffusion_batch_mult
         self.log_counter = 0
         self.log_batch_pred = 100
 
@@ -95,11 +103,11 @@ class Denoiser(nn.Module):
             os.makedirs(folder, exist_ok=True)
 
             x_path =  os.path.join(folder, "ground_truth_t={}.png".format(time_step))
-            save_img_as_fig(unpatchify(x_vis, self.denoising_net.patch_size, self.channels), 
+            save_img_as_fig(unpatchify(x_vis, self.patch_size, self.channels), 
                             file_path=x_path, size=self.img_size)
             
             x_pred_path = os.path.join(folder, "prediction_t={}.png".format(time_step))
-            save_img_as_fig(unpatchify(x_pred_vis, self.denoising_net.patch_size, self.channels), 
+            save_img_as_fig(unpatchify(x_pred_vis, self.patch_size, self.channels), 
                             file_path=x_pred_path.format(time_step), size=self.img_size)
 
             # save_img_as_fig(unpatchify(v_pred_vis, self.denoising_net.patch_size, N, self.channels), 

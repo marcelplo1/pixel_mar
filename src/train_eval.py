@@ -1,5 +1,7 @@
+from collections import defaultdict
 import copy
 import os
+import random
 import shutil
 import cv2
 from scipy import stats
@@ -22,7 +24,7 @@ def random_masking(x, orders, min_mask_rate=0.7):
                             src=torch.ones(bsz, seq_len, device=x.device))
     return mask
 
-def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, optimizer, device, global_rank=0):
+def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, optimizer, device):
     mae.train()
     denoiser.train()    
 
@@ -38,7 +40,7 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         x = patchify(samples, mae_single.patch_size)
         x_gt = x.clone().detach()
         orders = sample_order(x.shape[0], x.shape[1], device)
-        mask = random_masking(x, orders, args.min_mask_rate)
+        mask = random_masking(x, orders, mae_single.min_mask_rate)
 
         z = mae(x, mask, labels)
         
@@ -53,19 +55,20 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         mae_single.update_ema()
         denoiser_single.update_ema()
 
-        if args.use_wandb and local_rank == 0:
-            stats = {
-                "train/loss": loss.item(),
-                "train/lr": optimizer.param_groups[0]['lr'],
-            }
-            optimizer_step = step + epoch*len(dataloader)
-            log(stats, step=optimizer_step)
+        if local_rank == 0:
+            if args.use_wandb:
+                stats = {
+                    "train/loss": loss.item(),
+                    "train/lr": optimizer.param_groups[0]['lr'],
+                }
+                optimizer_step = step + epoch*len(dataloader)
+                log(stats, step=optimizer_step)
+        
+            print(f"Epoch {epoch+1}/{args.epochs}, Loss: {np.mean(loss.item()):.4f}")
 
-        losses.append(loss.item())
+    return optimizer_step
 
-    return losses
-
-def evaluate(args, mae, denoiser, device, epoch=None, metrics=None):
+def evaluate(args, mae, denoiser, device, model_params, epoch=None, metrics=None):
     mae.eval()
     denoiser.eval()
 
@@ -109,7 +112,6 @@ def evaluate(args, mae, denoiser, device, epoch=None, metrics=None):
 
     num_steps = args.num_images // (args.gen_batch_size * world_size) + 1
     bsz = args.gen_batch_size
-    images_per_class = {c: 0 for c in range(args.class_num)}
     for step in range(num_steps):
         start_idx = world_size * bsz * step + local_rank * bsz
         end_idx = start_idx + bsz
@@ -118,7 +120,7 @@ def evaluate(args, mae, denoiser, device, epoch=None, metrics=None):
         
         torch.distributed.barrier()
 
-        sampled_images = sample(args, mae, denoiser, labels_gen, device)
+        sampled_images = sample(args, mae, denoiser, labels_gen, device, model_params)
         sampled_images = (sampled_images + 1) / 2
         sampled_images = sampled_images.detach().cpu()
 
@@ -130,15 +132,23 @@ def evaluate(args, mae, denoiser, device, epoch=None, metrics=None):
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
 
-            cls = int(labels_gen[b_id].item())
-            num_samples = (10 // world_size) + (1 if local_rank < (10 % world_size) else 0)
-            if cls < args.class_num and images_per_class[cls] < num_samples:
-                class_filename = f'sample_class_{cls}_rank_{local_rank}_sample_{images_per_class[cls]}.png'
-                save_path = os.path.join(class_folder, class_filename)
-                if not os.path.exists(save_path):
-                    cv2.imwrite(save_path, gen_img)
-                    images_per_class[cls] += 1
+    torch.distributed.barrier()
 
+    if local_rank == 0:
+        all_ids = list(range(args.num_images))
+        sample_size = min(len(all_ids), 20)
+        selected_ids = random.sample(all_ids, sample_size)
+        
+        for i, img_id in enumerate(selected_ids):
+            cls = int(class_label_gen_world[img_id])
+            src = os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}.png')
+            
+            class_filename = f'sample_{i}_class_{cls}.png'
+            dst = os.path.join(class_folder, class_filename)
+            
+            if os.path.exists(src):
+                shutil.copy2(src, dst)
+                
     torch.distributed.barrier()
 
     if args.remove_ema == False:

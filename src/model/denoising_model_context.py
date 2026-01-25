@@ -31,21 +31,20 @@ class InContextBlock(nn.Module):
 
         return x
 
-class DenoisingMLP(nn.Module):
+class DenoisingModel(nn.Module):
     """
     The diffusion model
     """
     def __init__(
         self,
         img_size=256,
-        channels=3,
-        num_classes=10,
-        hidden_dim=768,
-        mae_hidden_dim=768,
         patch_size=16,
+        channels=3,
+        num_classes=1000,
+        hidden_dim=1024,
         depth=6,
-        final_bottleneck_dim=64,
-        ema_decay=0.999
+        dropout=0.0,
+        z_hidden_dim=768,
     ):
         super().__init__()
         self.in_channels = channels
@@ -53,7 +52,6 @@ class DenoisingMLP(nn.Module):
         self.patch_size = patch_size
         self.hidden_dim = hidden_dim
         self.img_size = img_size
-        self.num_classes = num_classes
 
         self.embedding_dim = channels * patch_size**2
         self.num_patches = (img_size // patch_size) ** 2
@@ -61,7 +59,7 @@ class DenoisingMLP(nn.Module):
         self.x_proj = nn.Linear(self.embedding_dim, hidden_dim)
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.y_embedder = nn.Embedding(num_classes + 1, hidden_dim)
-        self.z_proj = nn.Linear(mae_hidden_dim, hidden_dim)
+        self.z_proj = nn.Linear(z_hidden_dim, hidden_dim)
 
         self.blocks = nn.ModuleList([
             InContextBlock(hidden_dim, hidden_dim // 64)
