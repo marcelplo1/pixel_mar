@@ -1,5 +1,6 @@
 model:
   name: pixelMar_base_256
+  dataset_name: ImageNet
   params:
     img_size: 256
     patch_size: 16

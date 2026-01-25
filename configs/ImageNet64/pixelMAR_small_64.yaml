@@ -12,19 +12,19 @@ model:
     diffusion_btach_mul: 4
     pred_type: 'v'  
   mae_params:
-    encoder_dim: 768
-    encoder_depth: 12
-    encoder_num_heads: 12
-    decoder_dim: 768
-    decoder_depth: 12
-    decoder_num_heads: 12
+    encoder_dim: 512
+    encoder_depth: 6
+    encoder_num_heads: 8
+    decoder_dim: 512
+    decoder_depth: 6
+    decoder_num_heads: 8
     mlp_ratio: 4.0
     dropout: 0.1
     buffer_size: 64
     mask_ratio_min: 0.7
   denoiser_params:
-    hidden_dim: 1024
-    depth: 6
+    hidden_dim: 768
+    depth: 3
     dropout: 0.1
 
 sampler:

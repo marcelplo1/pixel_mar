@@ -29,6 +29,7 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
+    parser.add_argument('--grad_checkpointing', action='store_true')
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
@@ -77,23 +78,25 @@ def main():
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
-    if args.use_wandb and global_rank == 0 and not args.evaluate:
-        now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        exp_name = f"{args.model}_{args.img_size}px_{args.pred_type}-prediction_{now}"   
-        initialize_wandb(args, 
-                        entity=args.wandb_entity, 
-                        exp_name=exp_name,
-                        project_name=args.wandb_project
-        )
-
     model_config, sampler_config = parse_configs(args.config)
     model_params = model_config.get('params', None)
     mae_params = model_config.get('mae_params', None)
     denoiser_params = model_config.get('denoiser_params', None)
 
+    model_name = model_config.get('name', 'None')
+    dataset_name = model_config.get('dataset_name', 'ImageNet')
     args.img_size = model_params.get('img_size', 256)
     args.patch_size = model_params.get('patch_size', 16)
     args.channels = model_params.get('channels', 3)
+
+    if args.use_wandb and global_rank == 0 and not args.evaluate:
+        now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        exp_name = f"{model_name}_{dataset_name}_{args.img_size}px_{now}"   
+        initialize_wandb(args, 
+                        entity=args.wandb_entity, 
+                        exp_name=exp_name,
+                        project_name=args.wandb_project
+        )
 
     transform = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
@@ -119,7 +122,7 @@ def main():
     )
 
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler_train, 
-                            num_workers=10, pin_memory=True)
+                            num_workers=8, pin_memory=True, persistent_workers=True)
     
     # Load MAE from config file
     mae = MAE(
@@ -138,6 +141,8 @@ def main():
         buffer_size=mae_params.get('buffer_size', 64),
         min_mask_rate=mae_params.get('min_mask_rate', 0.7),
         num_classes=args.class_num,
+        grad_ckpt=args.grad_checkpointing
+
     ).to(device)
 
     # Load denoising model from config file
@@ -149,7 +154,8 @@ def main():
         depth=denoiser_params.get('depth', 6),
         dropout=denoiser_params.get('dropout', 0.1),
         z_hidden_dim=mae_params.get('decoder_dim', 768),
-        num_classes=args.class_num
+        num_classes=args.class_num,
+        grad_ckpt=args.grad_checkpointing
     )
     #Load denoiser from config file
     denoiser = Denoiser(
@@ -167,8 +173,13 @@ def main():
         use_logging=args.use_logging
     ).to(device)
 
-    mae = torch.nn.parallel.DistributedDataParallel(mae, device_ids=[args.gpu], find_unused_parameters=True)
-    denoiser = torch.nn.parallel.DistributedDataParallel(denoiser, device_ids=[args.gpu], find_unused_parameters=True)
+    n_mae_params = sum(p.numel() for p in mae.parameters() if p.requires_grad)
+    n_denoiser_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
+    n_params = n_mae_params + n_denoiser_params
+    print("Number of trainable parameters: {:.6f}M".format(n_params / 1e6))
+
+    mae = torch.nn.parallel.DistributedDataParallel(mae, device_ids=[args.gpu], find_unused_parameters=False)
+    denoiser = torch.nn.parallel.DistributedDataParallel(denoiser, device_ids=[args.gpu], find_unused_parameters=False)
     mae_single = mae.module
     denoiser_single = denoiser.module
     
@@ -211,7 +222,7 @@ def main():
     metrics = {k: [] for k in ['loss', 'fid', 'is', 'precision', 'recall']}
     if args.evaluate:
         print("Starting sampling...")
-        evaluate(args=args, mea=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, epoch=None, metrics=metrics)
+        evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=None, metrics=metrics)
         return
 
     print("Starting training...")
@@ -224,7 +235,7 @@ def main():
 
         if int(epoch) % args.online_eval_freq == 0:
             print("Starting online evaluation...")
-            evaluate(args=args, mea=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, epoch=epoch, metrics=metrics)
+            evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics)
 
         if global_rank == 0:
             if int(epoch) % args.save_freq == 0:
@@ -239,7 +250,7 @@ def main():
                     "ema_mae": mae_single.ema_params,
                     "ema_denoiser": denoiser_single.ema_params,
 
-                    "epoch": args.epoch,
+                    "epoch": epoch,
                     "step": global_step,
 
                     "config_path": args.config,

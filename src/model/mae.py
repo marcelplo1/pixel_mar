@@ -2,6 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import Block
+from torch.utils.checkpoint import checkpoint
 
 from utils.utils import get_2d_sincos_pos_embed
     
@@ -23,7 +24,8 @@ class MAE(nn.Module):
             mlp_ratio=4.0, 
             dropout=0.1, 
             buffer_size=64,
-            min_mask_rate = 0.7
+            min_mask_rate = 0.7,
+            grad_ckpt = False,
         ):
         super().__init__()
 
@@ -32,8 +34,11 @@ class MAE(nn.Module):
         self.buffer_size = buffer_size
         self.encoder_dim = encoder_dim
         self.decoder_dim = decoder_dim
+        self.img_size = img_size
+        self.channels = channels
         self.seq_len = (img_size // patch_size) ** 2
         self.embed_dim = channels * patch_size**2
+        self.grad_ckpt = grad_ckpt
 
         # self.encoder_proj = nn.Sequential(
         #     nn.Linear(self.embed_dim, bottleneck_dim),
@@ -116,10 +121,14 @@ class MAE(nn.Module):
 
         x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, self.encoder_dim)
 
-        for block in self.encoder_block:
-            x = block(x)
-        encoded = self.encoder_norm(x)
-        
+        if self.grad_ckpt and not torch.jit.is_scripting():
+            for block in self.encoder_block:
+                x = checkpoint(block, x)
+        else:
+            for block in self.encoder_block:
+                x = block(x)
+
+        encoded = self.encoder_norm(x)        
         return encoded
     
     def forward_decoder(self, x, mask):
@@ -132,8 +141,13 @@ class MAE(nn.Module):
 
         x = x_after_pad + self.decoder_pos_emb
 
-        for block in self.decoder_block:
-            x = block(x)
+        if self.grad_ckpt and not torch.jit.is_scripting():
+            for block in self.decoder_block:
+                x = checkpoint(block, x)
+        else:
+            for block in self.decoder_block:
+                x = block(x)
+
         decoded = self.decoder_norm(x)
         decoded = decoded[:, self.buffer_size:]
 

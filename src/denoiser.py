@@ -160,7 +160,7 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def _heun_step(self, xt, z, t, t_next, labels):
-        v_pred_t = self._forward_sample(xt, z, t)
+        v_pred_t = self._forward_sample(xt, z, t, labels)
 
         xt_next_euler = xt + (t_next - t) * v_pred_t
         v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next, labels)

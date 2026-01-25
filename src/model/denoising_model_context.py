@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 import math
 from utils.utils import RMSNorm
+from torch.utils.checkpoint import checkpoint
 
 class InContextBlock(nn.Module):
     def __init__(
@@ -22,7 +23,7 @@ class InContextBlock(nn.Module):
         self.mlp_ln = RMSNorm(hidden_dim, eps=1e-6)
         self.mlp = SwiGLUFFN(hidden_dim, int(hidden_dim * mlp_ratio), drop=proj_drop)
 
-    #@torch.compile
+    @torch.compile
     def forward(self, x):     
         x = self.attn_ln(x)
 
@@ -45,6 +46,7 @@ class DenoisingModel(nn.Module):
         depth=6,
         dropout=0.0,
         z_hidden_dim=768,
+        grad_ckpt = False
     ):
         super().__init__()
         self.in_channels = channels
@@ -52,6 +54,7 @@ class DenoisingModel(nn.Module):
         self.patch_size = patch_size
         self.hidden_dim = hidden_dim
         self.img_size = img_size
+        self.grad_ckpt = grad_ckpt
 
         self.embedding_dim = channels * patch_size**2
         self.num_patches = (img_size // patch_size) ** 2
@@ -120,8 +123,12 @@ class DenoisingModel(nn.Module):
         x = x.unsqueeze(1)
         x = torch.cat([x, c], dim=1)
 
-        for i, block in enumerate(self.blocks):
-            x = block(x)
+        if self.grad_ckpt and not torch.jit.is_scripting():
+            for block in self.blocks:
+                x = checkpoint(block, x)
+        else:
+            for block in self.blocks:
+                x = block(x)
 
         x = x[:, 0, :]
         x = self.final_layer(x)

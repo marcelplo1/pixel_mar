@@ -31,7 +31,6 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
     
-    losses = []
     for step, (samples, labels) in enumerate(dataloader):
         adjust_learning_rate(optimizer, step / len(dataloader) + epoch, args)
         samples = samples.to(device, non_blocking=True)
@@ -42,9 +41,9 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         orders = sample_order(x.shape[0], x.shape[1], device)
         mask = random_masking(x, orders, mae_single.min_mask_rate)
 
-        z = mae(x, mask, labels)
-        
-        loss = denoiser(x_gt, z, mask, labels)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            z = mae(x, mask, labels)
+            loss = denoiser(x_gt, z, mask, labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -55,20 +54,20 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         mae_single.update_ema()
         denoiser_single.update_ema()
 
+
+        optimizer_step = step + epoch*len(dataloader)
         if local_rank == 0:
             if args.use_wandb:
                 stats = {
                     "train/loss": loss.item(),
                     "train/lr": optimizer.param_groups[0]['lr'],
                 }
-                optimizer_step = step + epoch*len(dataloader)
                 log(stats, step=optimizer_step)
         
-            print(f"Epoch {epoch+1}/{args.epochs}, Loss: {np.mean(loss.item()):.4f}")
-
+    print(f"Epoch {epoch+1}/{args.epochs}, Loss: {np.mean(loss.item()):.4f}")
     return optimizer_step
 
-def evaluate(args, mae, denoiser, device, model_params, epoch=None, metrics=None):
+def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=None, metrics=None):
     mae.eval()
     denoiser.eval()
 
@@ -120,7 +119,7 @@ def evaluate(args, mae, denoiser, device, model_params, epoch=None, metrics=None
         
         torch.distributed.barrier()
 
-        sampled_images = sample(args, mae, denoiser, labels_gen, device, model_params)
+        sampled_images = sample(args, mae, denoiser, labels_gen, device, model_params, sampler_params)
         sampled_images = (sampled_images + 1) / 2
         sampled_images = sampled_images.detach().cpu()
 

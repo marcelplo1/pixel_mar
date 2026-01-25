@@ -11,7 +11,7 @@ def mask_by_order(mask_len, order, bsz, seq_len, device ):
     return masking
 
 @torch.no_grad()
-def sample(args, mae, denoiser, labels, device, model_params):
+def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -20,7 +20,7 @@ def sample(args, mae, denoiser, labels, device, model_params):
     img_size = mae.img_size
     channels = mae.channels
     noise_scale = model_params.get('noise_scale', 1.0)
-    num_ar_steps = model_params.get('num_ar_steps', 64)
+    num_ar_steps = sampler_params.get('num_ar_steps', 64)
 
     seq_len = (img_size// patch_size) ** 2
     embed_dim = (patch_size ** 2) * channels
