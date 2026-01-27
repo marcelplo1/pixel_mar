@@ -78,6 +78,8 @@ def main():
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
+    os.makedirs(args.output_dir, exist_ok=True)
+
     model_config, sampler_config = parse_configs(args.config)
     model_params = model_config.get('params', None)
     mae_params = model_config.get('mae_params', None)
@@ -233,7 +235,7 @@ def main():
         global_step = train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, 
                                        optimizer, device)
 
-        if int(epoch) % args.online_eval_freq == 0:
+        if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0:
             print("Starting online evaluation...")
             evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics)
 

@@ -131,8 +131,6 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
 
-    torch.distributed.barrier()
-
     if local_rank == 0:
         all_ids = list(range(args.num_images))
         sample_size = min(len(all_ids), 20)
@@ -197,8 +195,6 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
                 metrics['precision'].append(precision)
             if metrics['recall'] is not None:
                 metrics['recall'].append(recall)
-
-        torch.distributed.barrier()
         
         if local_rank == 0:
             if args.use_wandb and epoch is not None:
@@ -209,3 +205,5 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
                 }
                 log(stats)
             shutil.rmtree(save_folder_fid)
+
+    torch.distributed.barrier()
