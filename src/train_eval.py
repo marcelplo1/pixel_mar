@@ -79,7 +79,7 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
         class_folder = os.path.join(args.output_dir, "train_class_samples", 'epoch{}'.format(epoch))
     else:
         save_folder_fid = os.path.join(args.output_dir, "eval_fid_samples")
-        class_folder = os.path.join(args.output_dir, "eval_class_samples", 'epoch{}'.format(epoch))
+        class_folder = os.path.join(args.output_dir, "eval_class_samples")
 
     if local_rank == 0: 
         os.makedirs(class_folder, exist_ok=True)

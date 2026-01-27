@@ -197,7 +197,7 @@ def main():
         checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
 
         mae_single.load_state_dict(checkpoint['mae'])
-        denoiser_single.load_state_dict(checkpoint['denoising'])
+        denoiser_single.load_state_dict(checkpoint['denoiser'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         mae_single.ema_params = checkpoint['ema_mae']
         denoiser_single.ema_params = checkpoint['ema_denoiser']
@@ -210,14 +210,12 @@ def main():
         if 'sampler_config' in checkpoint and sampler_config != checkpoint['sampler_config']:
             print("Sampler config loaded from checkpoint is different")
             return
-        
-        print("Checkpoint loaded...")
+
         print("Loaded epoch: {}".format(checkpoint.get('epoch', None)))
         print("Total training steps: {}".format(checkpoint.get('step', None)))
-        print("Config path: {}".format(checkpoint.get('config_path', None)))
-        print("Seed: {}".format(checkpoint.get('seed', None)))
-        print("Args: {}".format(checkpoint.get('args', None)))
+        print("Checkpoint args: {} \n".format(checkpoint.get('args', None)).replace(', ', ',\n'))
     else:
+        print("{}".format(args).replace(', ', ',\n'))
         mae_single.ema_params = copy.deepcopy(list(mae.parameters()))
         denoiser_single.ema_params = copy.deepcopy(list(denoiser.parameters()))
 
