@@ -26,6 +26,8 @@ class MAE(nn.Module):
             buffer_size=64,
             min_mask_rate = 0.7,
             grad_ckpt = False,
+            lable_dropout = 0.1,
+            mae_config = None
         ):
         super().__init__()
 
@@ -46,9 +48,9 @@ class MAE(nn.Module):
         #     nn.Linear(bottleneck_dim, hidden_dim)
         # )
 
-        self.x_proj = nn.Linear(self.embed_dim, encoder_dim, bias=True)
+        self.x_proj = nn.Linear(self.embed_dim, self.encoder_dim, bias=True)
         self.x_ln = nn.LayerNorm(encoder_dim, eps=1e-6)
-        self.decoder_embed = nn.Linear(self.decoder_dim, decoder_dim, bias=True)
+        self.decoder_embed = nn.Linear(self.encoder_dim, self.decoder_dim, bias=True)
 
         self.mask_token  = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         self.class_emb = nn.Embedding(num_classes, encoder_dim)
@@ -66,8 +68,8 @@ class MAE(nn.Module):
                   proj_drop=dropout, attn_drop=dropout) for _ in range(decoder_depth)])
         self.decoder_norm = nn.LayerNorm(decoder_dim, eps=1e-6)
 
-        #self.label_drop_prob = 0.1
-        #self.fake_latent = nn.Parameter(torch.zeros(1, hidden_dim))
+        self.label_drop_prob = lable_dropout
+        self.fake_latent = nn.Parameter(torch.zeros(1, encoder_dim))
 
         self.ema_decay=ema_decay
         self.ema_params = None
@@ -100,6 +102,7 @@ class MAE(nn.Module):
 
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
+        nn.init.trunc_normal_(self.fake_latent, std=.02)
 
     def forward_encoder(self, x, mask, class_emb):
         x = self.x_proj(x)
@@ -108,7 +111,7 @@ class MAE(nn.Module):
         x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
         mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
 
-        if self.training and False: #TODO apply label dropping together with denoiser
+        if self.training: #TODO apply label dropping together with denoiser
             drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
             drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
             class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_emb

@@ -11,12 +11,12 @@ import torch.distributed as dist
 import copy
 
 from denoiser import Denoiser
-from model.denoising_model_context import DenoisingModel
+from model.denoising_model import DenoisingModel
 from model.mae import MAE
 from utils import ddp
 from utils.configs_utils import parse_configs
 from utils.utils import center_crop_arr, save_plot, write_csv
-from train_eval import evaluate, train_one_epoch
+from train_eval import calc_val_loss, evaluate, train_one_epoch
 from utils.wandb_utils import initialize_wandb
 
 
@@ -30,14 +30,16 @@ def create_parser():
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
     parser.add_argument('--grad_checkpointing', action='store_true')
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1000, help="Training epochs")
     parser.add_argument("--warmup_epochs", type=int, default=100, help="Number of warmup epochs")
-    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
     parser.add_argument('--weight_decay', default=0.02, type=float, help='Weight decay for the optimizer')
-    parser.add_argument("--save_freq", type=int, default=50, help="Frequency of saving the checkpoint")
+    parser.add_argument("--save_freq", type=int, default=5, help="Frequency of saving the checkpoint")
+    parser.add_argument("--label_drop_prob", type=float, default=0.1, help="Learning rate")
 
     # Sampling 
     parser.add_argument("--gen_batch_size", type=int, default=16, help="Batch size for sampling")
@@ -108,11 +110,16 @@ def main():
     ])
 
     dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
+    val_dataset = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform)
 
     if args.has_fixed_target_class:
         targets = torch.tensor(dataset.targets)
         indices = (targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
         dataset = Subset(dataset, indices)
+
+        val_indices = (torch.tensor(val_dataset.targets) == args.fixed_target_class).nonzero(as_tuple=True)[0]
+        val_dataset = Subset(val_dataset, val_indices)
+
         if len(dataset) == 0:
             print("Fixed dataset class not found!")
             return
@@ -123,8 +130,16 @@ def main():
         dataset, num_replicas=world_size, rank=global_rank, shuffle=True
     )
 
+    sampler_val = DistributedSampler(
+        val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False
+    )
+
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler_train, 
                             num_workers=8, pin_memory=True, persistent_workers=True)
+    
+    dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, sampler=sampler_val, 
+                            num_workers=8, pin_memory=True, persistent_workers=True
+    )
     
     # Load MAE from config file
     mae = MAE(
@@ -143,8 +158,9 @@ def main():
         buffer_size=mae_params.get('buffer_size', 64),
         min_mask_rate=mae_params.get('min_mask_rate', 0.7),
         num_classes=args.class_num,
-        grad_ckpt=args.grad_checkpointing
-
+        grad_ckpt=args.grad_checkpointing,
+        lable_dropout=args.label_drop_prob,
+        mae_config=mae_params.get('mae_config', None)
     ).to(device)
 
     # Load denoising model from config file
@@ -157,7 +173,8 @@ def main():
         dropout=denoiser_params.get('dropout', 0.1),
         z_hidden_dim=mae_params.get('decoder_dim', 768),
         num_classes=args.class_num,
-        grad_ckpt=args.grad_checkpointing
+        grad_ckpt=args.grad_checkpointing,
+        denoiser_type=args.denoiser_type
     )
     #Load denoiser from config file
     denoiser = Denoiser(
@@ -165,11 +182,12 @@ def main():
         output_dir=args.output_dir,
         sampling_method=sampler_config.get('method', 'euler'),
         pred_type=model_params.get('pred_type', 'v'),
-        diffusion_batch_multi=model_params.get('diffusion_batch_multi', 4),
+        diffusion_batch_mul=model_params.get('diffusion_batch_mul', 4),
         num_timesteps=sampler_config.get('num_timesteps', 100),
         sample_t_mean=model_params.get('sample_t_mean', 0.0),
         sample_t_std=model_params.get('sample_t_std', 1.0),
         t_eps=model_params.get('t_eps', 1e-2),
+        t_eps_sample=model_params.get('t_eps_sample', 1e-5),
         noise_scale=sampler_config.get('noise_scale', 1.0),
         ema_decay=model_params.get('ema_decay', 0.9999),
         use_logging=args.use_logging
@@ -232,10 +250,13 @@ def main():
 
         global_step = train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, 
                                        optimizer, device)
+        
+        calc_val_loss(args, mae_single, denoiser_single, dataloader_val, epoch, device)
 
-        if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0:
+        if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0 or epoch == args.epochs:
             print("Starting online evaluation...")
             evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics)
+            print("Online evaluation finsihed")
 
         if global_rank == 0:
             if int(epoch) % args.save_freq == 0:
@@ -260,14 +281,7 @@ def main():
                     "args": vars(args)
                 }
                 torch.save(checkpoint, ckpt_path)
-
-            metrics_folder = os.path.join(args.output_dir, "quality_metrics")
-            os.makedirs(metrics_folder, exist_ok=True)
-            save_plot(metrics['fid'], "fid.png", metrics_folder, y_label="FID")
-            save_plot(metrics['is'], "is.png", metrics_folder, y_label="IS")
-
-            write_csv("fid.csv", metrics_folder, metrics['fid'])
-            write_csv("is.csv", metrics_folder, metrics['is'])
+                print("Saving online checkpoint finished")
 
 if __name__ == "__main__":
     main()

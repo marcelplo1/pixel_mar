@@ -13,11 +13,12 @@ class Denoiser(nn.Module):
         output_dir,
         sampling_method = 'euler',
         pred_type = 'v',
-        diffusion_batch_multi=4,
+        diffusion_batch_mul=4,
         num_timesteps = 100,
         sample_t_mean = 0.0,
         sample_t_std = 1.0,
         t_eps = 1e-2,
+        t_eps_sample = 1e-5,
         noise_scale = 1.0,
         ema_decay = 0.9999,
         use_logging=False
@@ -33,6 +34,7 @@ class Denoiser(nn.Module):
         self.P_mean = sample_t_mean
         self.P_std = sample_t_std
         self.t_eps = t_eps
+        self.t_eps_sample = t_eps_sample
         self.noise_scale = noise_scale
         self.method = sampling_method
         self.steps = num_timesteps
@@ -42,7 +44,7 @@ class Denoiser(nn.Module):
 
         self.pred_type = pred_type
         self.ema_decay = ema_decay
-        self.diffusion_batch_mul = diffusion_batch_multi
+        self.diffusion_batch_mul = diffusion_batch_mul
 
         self.ema_params = None
         self.log_counter = 0
@@ -59,23 +61,28 @@ class Denoiser(nn.Module):
         labels = labels.repeat(self.diffusion_batch_mul*N)
         mask = mask.reshape(B*N).repeat(self.diffusion_batch_mul)
 
+        if self.training:
+            t_eps = self.t_eps
+        else:
+            t_eps = self.t_eps_sample
+
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
 
         xt = t * x + (1 - t) * e
-        v = (x - xt) / (1 - t).clamp_min(self.t_eps)
+        v = (x - xt) / (1 - t).clamp_min(t_eps)
 
         pred = self.denoising_net(xt, z, t.flatten(), labels)
 
         if self.pred_type == 'x':
-            v_pred = (pred - xt) / (1 - t).clamp_min(self.t_eps)
+            v_pred = (pred - xt) / (1 - t).clamp_min(t_eps)
             x_pred = pred
         elif self.pred_type == 'v':
             v_pred = pred
-            x_pred = xt + (1-t).clamp_min(self.t_eps) * pred
+            x_pred = xt + (1-t).clamp_min(t_eps) * pred
         elif self.pred_type == 'e':
-            v_pred = (xt-pred)/(t).clamp_min(self.t_eps)
-            x_pred = (xt-(1-t) * pred) / t.clamp_min(self.t_eps)
+            v_pred = (xt-pred)/(t).clamp_min(t_eps)
+            x_pred = (xt-(1-t) * pred) / t.clamp_min(t_eps)
 
         # l2 loss
         loss = (v - v_pred) ** 2
@@ -122,7 +129,7 @@ class Denoiser(nn.Module):
     def generate(self, xt, z, labels):
         device = z.device
         bsz = xt.size(0)
-        timesteps = torch.linspace(self.t_eps, 1.0 - self.t_eps, self.steps+1, device=device)
+        timesteps = torch.linspace(self.t_eps_sample, 1.0 - self.t_eps_sample, self.steps+1, device=device)
         timesteps = timesteps.view(-1, 1, 1).expand(-1, bsz, 1)  
 
         if self.method == "euler":

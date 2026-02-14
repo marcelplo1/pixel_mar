@@ -16,9 +16,9 @@ def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     bsz = args.gen_batch_size
-    patch_size = mae.patch_size
-    img_size = mae.img_size
-    channels = mae.channels
+    patch_size = args.patch_size
+    img_size = args.img_size
+    channels = args.channels
     noise_scale = model_params.get('noise_scale', 1.0)
     num_ar_steps = sampler_params.get('num_ar_steps', 64)
 

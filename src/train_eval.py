@@ -67,6 +67,35 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
     print(f"Epoch {epoch+1}/{args.epochs}, Loss: {np.mean(loss.item()):.4f}")
     return optimizer_step
 
+@torch.no_grad()
+def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
+    local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+    world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+    losses = []
+    for step, (samples, labels) in enumerate(val_dataloader):
+        samples = samples.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+
+        x = patchify(samples, mae.patch_size)
+        x_gt = x.clone().detach()
+        orders = sample_order(x.shape[0], x.shape[1], device)
+        mask = random_masking(x, orders, mae.min_mask_rate)
+
+        z = mae(x, mask, labels)
+        loss = denoiser(x_gt, z, mask, labels)
+        losses.append(loss.item())
+
+    if local_rank == 0:
+        if args.use_wandb:
+            stats = {
+                "evaluation/val_loss": sum(losses) / len(losses),
+                "epoch" : epoch
+            }
+            log(stats)
+            
+    torch.distributed.barrier()
+
 def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=None, metrics=None):
     mae.eval()
     denoiser.eval()
