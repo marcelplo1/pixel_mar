@@ -12,6 +12,7 @@ model:
     diffusion_batch_mul: 4
     pred_type: 'x'  
   mae_params:
+    mae_config: facebook/vit-mae-base
     encoder_dim: 768
     encoder_depth: 12
     encoder_num_heads: 12

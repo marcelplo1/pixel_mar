@@ -14,15 +14,6 @@ from utils.wandb_utils import log
 
 from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, unpatchify
 
-def random_masking(x, orders, min_mask_rate=0.7):
-    bsz, seq_len, embed_dim = x.shape
-    mask_rate = min_mask_rate
-    mask_rate = stats.truncnorm((min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]
-    num_masked_tokens = int(np.ceil(seq_len * mask_rate))
-    mask = torch.zeros(bsz, seq_len, device=x.device)
-    mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
-                            src=torch.ones(bsz, seq_len, device=x.device))
-    return mask
 
 def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, optimizer, device):
     mae.train()
@@ -36,13 +27,12 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        x = patchify(samples, mae_single.patch_size)
+        x = patchify(samples, args.patch_size)
         x_gt = x.clone().detach()
         orders = sample_order(x.shape[0], x.shape[1], device)
-        mask = random_masking(x, orders, mae_single.min_mask_rate)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            z = mae(x, mask, labels)
+            z, mask, z_pixels = mae(samples, orders, labels)
             loss = denoiser(x_gt, z, mask, labels)
 
         optimizer.zero_grad()
@@ -80,9 +70,8 @@ def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
         x = patchify(samples, mae.patch_size)
         x_gt = x.clone().detach()
         orders = sample_order(x.shape[0], x.shape[1], device)
-        mask = random_masking(x, orders, mae.min_mask_rate)
 
-        z = mae(x, mask, labels)
+        z, mask, z_pixels = mae(samples, orders, labels)
         loss = denoiser(x_gt, z, mask, labels)
         losses.append(loss.item())
 

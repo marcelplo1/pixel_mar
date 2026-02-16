@@ -5,6 +5,7 @@ import torch
 import torch.nn as nn
 from timm.models.vision_transformer import Block
 from torch.utils.checkpoint import checkpoint
+from transformers import ViTMAEConfig, ViTMAEForPreTraining
 
 from utils.utils import get_2d_sincos_pos_embed, patchify
     
@@ -50,21 +51,11 @@ class MAE(nn.Module):
         #     nn.Linear(bottleneck_dim, hidden_dim)
         # )
 
-        self.x_proj = nn.Linear(self.embed_dim, self.encoder_dim, bias=True)
-        self.x_ln = nn.LayerNorm(encoder_dim, eps=1e-6)
-        self.decoder_embed = nn.Linear(self.encoder_dim, self.decoder_dim, bias=True)
-
         self.mask_token  = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         self.class_emb = nn.Embedding(num_classes, encoder_dim)
         
-        self.encoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, encoder_dim), requires_grad=True)
+        self.decoder_embed = nn.Linear(self.encoder_dim, self.decoder_dim, bias=True)
         self.decoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_dim),  requires_grad=True)
-
-        self.encoder_block = nn.ModuleList([
-            Block(encoder_dim, encoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
-                  proj_drop=dropout, attn_drop=dropout) for _ in range(encoder_depth)])
-        self.encoder_norm = nn.LayerNorm(encoder_dim, eps=1e-6)
-
         self.decoder_block = nn.ModuleList([
             Block(decoder_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
                   proj_drop=dropout, attn_drop=dropout) for _ in range(decoder_depth)])
@@ -77,6 +68,17 @@ class MAE(nn.Module):
         self.ema_params = None
 
         self.initialize_weights()
+
+        # Important that this is AFTER the initialize
+        config = ViTMAEConfig.from_pretrained(mae_config)
+        config.image_size = int(img_size)
+        config.patch_size = int(patch_size)
+        config.num_channels = int(channels)
+        self.model_name = mae_config
+        self.encoder_mae = ViTMAEForPreTraining.from_pretrained(self.model_name, config=config, ignore_mismatched_sizes=True).vit
+        for param in self.encoder_mae.parameters():
+            param.requires_grad = False
+        self.encoder_mae.eval()
 
     def initialize_weights(self):
         def _init_weights(m):
@@ -92,10 +94,10 @@ class MAE(nn.Module):
         self.apply(_init_weights)
 
         grid_size = int(self.seq_len ** 0.5)
-        pos_embed_grid = get_2d_sincos_pos_embed(self.encoder_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.encoder_dim)
-        full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        self.encoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
+        # pos_embed_grid = get_2d_sincos_pos_embed(self.encoder_dim, grid_size)
+        # full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.encoder_dim)
+        # full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
+        # self.encoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
 
         pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
         full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.decoder_dim)
@@ -105,70 +107,38 @@ class MAE(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
         nn.init.trunc_normal_(self.fake_latent, std=.02)
+    
+    def forward_encoder(self, x, class_emb):
+        mask_rate = stats.truncnorm((self.min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]
+        self.encoder_mae.config.mask_ratio = mask_rate
 
-    def forward_encoder(self, x, mask, class_emb):
-        x = self.x_proj(x)
-        bsz, seq_len, embed_dim = x.shape
+        output = self.encoder_mae(x, mask_rate=mask_rate, interpolate_pos_encoding=True)
+        x = output.last_hidden_state
+        mask = output.mask
+        ids_restore = output.ids_restore
 
-        x = torch.cat([torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device), x], dim=1)
-        mask_with_buffer = torch.cat([torch.zeros(x.size(0), self.buffer_size, device=x.device), mask], dim=1)
-
-        if self.training: #TODO apply label dropping together with denoiser
-            drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
-            class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_emb
-        else:
-            class_embedding = class_emb
-
-        x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
-        x = x + self.encoder_pos_emb
-        x = self.x_ln(x)
-
-        x = x[(1-mask_with_buffer).nonzero(as_tuple=True)].reshape(bsz, -1, self.encoder_dim)
-
-        if self.grad_ckpt and not torch.jit.is_scripting():
-            for block in self.encoder_block:
-                x = checkpoint(block, x)
-        else:
-            for block in self.encoder_block:
-                x = block(x)
-
-        encoded = self.encoder_norm(x)        
-        return encoded
+        return x, mask, ids_restore
     
     def encoder_generate(self, x, orders, num_visible, class_emb):
-        x = self.x_proj(x)
-        bsz, seq_len, embed_dim = x.shape
+        self.encoder_mae.config.mask_ratio = 0
+        #noise = torch.arange(self.seq_len).unsqueeze(0).expand(x.shape[0],-1).to(x.device).to(x.dtype)
 
-        x = torch.gather(x, dim=1, index=orders.unsqueeze(-1).expand(-1, -1, embed_dim))
-        buffer_tokens = torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device)
-        x = torch.cat([buffer_tokens, x], dim=1)
+        x_embedding = self.encoder_mae.embeddings(x)
+        x_embedding = x_embedding[0] if isinstance(x_embedding, tuple) else x_embedding
 
-        if self.training: #TODO apply label dropping together with denoiser
-            drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
-            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
-            class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_emb
-        else:
-            class_embedding = class_emb
+        B, N, D = x_embedding.shape
+        cls_token = x_embedding[:, :1, :]
+        img_tokens = x_embedding[:, 1:, :]
 
-        x[:, :self.buffer_size] = class_embedding.unsqueeze(1)
-        x = x + self.encoder_pos_emb
-        x = self.x_ln(x)
+        x = torch.gather(img_tokens, dim=1, index=orders[:, :num_visible].unsqueeze(-1).expand(-1, -1, D))
 
-        x = x[:, :self.buffer_size + num_visible, :]
-
-        if self.grad_ckpt and not torch.jit.is_scripting():
-            for block in self.encoder_block:
-                x = checkpoint(block, x)
-        else:
-            for block in self.encoder_block:
-                x = block(x)
-
-        encoded = self.encoder_norm(x)        
-        return encoded
+        x = torch.cat([cls_token, x], dim=1)
+        output = self.encoder_mae.encoder(x)
+        return output.last_hidden_state
     
     def forward_decoder(self, x, ids_restore):
         x = self.decoder_embed(x)
+        B, N, D = x.shape
 
         x_buffer = x[:, :self.buffer_size, :]
         x_visible = x[:, self.buffer_size:, :]
@@ -193,29 +163,45 @@ class MAE(nn.Module):
         decoded = decoded[:, self.buffer_size:]
 
         return decoded
-    
-    
 
     def forward(self, x, mask_orders, labels, num_visible=None):
-        x = patchify(x, self.patch_size)
-        B, N, D = x.shape
+        self.encoder_mae.eval()
+        B, C, H, W = x.shape
         class_embedding = self.class_emb(labels)
 
-        ids_restore = torch.argsort(mask_orders, dim=1)
+        # Pretrain MAE need a range of 0 to 1
+        x = (x + 1.0) / 2.0
+
+        if H != self.img_size or W != self.img_size:
+            x = nn.functional.interpolate(x, size=(self.img_size, self.img_size), mode='bicubic', align_corners=False)
 
         if self.training:
-            mask = self.random_masking(x, mask_orders, self.min_mask_rate)
-            num_masked = int(mask[0].sum().item())
-            num_vis = N - num_masked
-            x = self.encoder_generate(x, mask_orders, num_vis, class_embedding)
+            x, mask, ids_restore = self.forward_encoder(x, class_embedding)
         else:
-            mask = torch.zeros(B, N, device=x.device)
+            x = self.encoder_generate(x, mask_orders, num_visible, class_embedding)
+            mask = torch.zeros(B, self.seq_len, device=x.device)
+            ids_restore = torch.argsort(mask_orders, dim=1)
             indices_to_mask = mask_orders[:, num_visible:]
             mask.scatter_(1, indices_to_mask.long(), 1.0)
-            
-            x = self.encoder_generate(x, mask_orders, num_visible, class_embedding)
+            # x = self.encoder_generate(x, mask_orders, num_visible, class_embedding)
+            # mask = torch.zeros(B, self.seq_len, device=x.device)
+            # ids_restore = mask_orders 
+            # indices_to_mask = mask_orders[:, num_visible:]
+            # mask.scatter_(1, indices_to_mask.long(), 1.0)
 
-        # 2. Decode using the unified shuffle/restore logic
+        buffer_tokens = torch.zeros(B, self.buffer_size, x.shape[2], device=x.device)
+        x = x[:, 1:, :]
+        x = torch.cat([buffer_tokens, x], dim=1)
+
+        if self.training: #TODO apply label dropping together with denoiser
+            drop_latent_mask = torch.rand(B) < self.label_drop_prob
+            drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
+            conditioned_class_emb = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_embedding
+        else:
+            conditioned_class_emb = class_embedding
+
+        x[:, :self.buffer_size] = conditioned_class_emb.unsqueeze(1)
+
         z = self.forward_decoder(x, ids_restore)
 
         return z, mask, None

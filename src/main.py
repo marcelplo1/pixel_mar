@@ -12,7 +12,7 @@ import copy
 
 from denoiser import Denoiser
 from model.denoising_model import DenoisingModel
-from model.mae import MAE
+from model.mae_v2 import MAE
 from utils import ddp
 from utils.configs_utils import parse_configs
 from utils.utils import center_crop_arr, save_plot, write_csv
@@ -31,6 +31,7 @@ def create_parser():
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
     parser.add_argument('--grad_checkpointing', action='store_true')
     parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser")
+    parser.add_argument("--mae_type", type=str, default="freezed_encoder", help="Type of the denoiser")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
