@@ -12,7 +12,7 @@ import copy
 
 from denoiser import Denoiser
 from model.denoising_model import DenoisingModel
-from model.mae_v2 import MAE
+from model.mae_v3 import MAE
 from utils import ddp
 from utils.configs_utils import parse_configs
 from utils.utils import center_crop_arr, save_plot, write_csv
@@ -254,7 +254,8 @@ def main():
         
         calc_val_loss(args, mae_single, denoiser_single, dataloader_val, epoch, device)
 
-        if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0 or epoch == args.epochs:
+        #if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0 or epoch == args.epochs:
+        if int(epoch) % args.online_eval_freq == 0 or epoch == args.epochs:
             print("Starting online evaluation...")
             evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics)
             print("Online evaluation finsihed")
