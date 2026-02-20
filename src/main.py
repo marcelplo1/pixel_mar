@@ -5,14 +5,14 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.optim as optim
-from torch.utils.data import DataLoader, Subset, DistributedSampler
+from torch.utils.data import DataLoader, Subset, ConcatDataset, DistributedSampler
 from torchvision import datasets, transforms
 import torch.distributed as dist
 import copy
 
-from denoiser import Denoiser
+from model.denoiser import Denoiser
 from model.denoising_model import DenoisingModel
-from model.mae_v3 import MAE
+from model.mae_v2 import MAE
 from utils import ddp
 from utils.configs_utils import parse_configs
 from utils.utils import center_crop_arr, save_plot, write_csv
@@ -126,7 +126,7 @@ def main():
             return
          
         print(f"Filtered dataset to class {args.fixed_target_class}. New size: {len(dataset)}")
-    
+        
     sampler_train = DistributedSampler(
         dataset, num_replicas=world_size, rank=global_rank, shuffle=True
     )

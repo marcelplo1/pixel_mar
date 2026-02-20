@@ -1,0 +1,47 @@
+model:
+  name: pixelMar_large_256
+  dataset_name: ImageNet
+  params:
+    img_size: 256
+    patch_size: 16
+    in_channels: 3
+    ema_decay: 0.9999
+    t_eps: 1.0e-2
+    sample_t_mean: -0.8
+    sample_t_std: 0.8
+    diffusion_batch_mul: 4
+    pred_type: 'x'  
+  mae_params:
+    mae_config: facebook/vit-mae-large
+    encoder_dim: 1024
+    encoder_depth: 24
+    encoder_num_heads: 12
+    decoder_dim: 512
+    decoder_depth: 12
+    decoder_num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    buffer_size: 64
+    mask_ratio_min: 0.7
+  denoiser_params:
+    hidden_dim: 1024
+    depth: 6
+    dropout: 0.1
+
+sampler:
+  method: 'heun'
+  num_generation_passes: 2 
+  t_eps_sample: 1.0e-5
+  num_ar_steps: 32
+  num_timesteps: 50
+  noise_scale: 1.0
+
+
+
+
+
+
+
+
+
+  

@@ -6,7 +6,8 @@ import torch.nn as nn
 from timm.models.vision_transformer import Block
 from torch.utils.checkpoint import checkpoint
 
-from utils.utils import get_2d_sincos_pos_embed, patchify
+from model.model_utils import get_2d_sincos_pos_embed
+from utils.utils import patchify
     
 
 class MAE(nn.Module):

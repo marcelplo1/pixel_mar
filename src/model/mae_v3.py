@@ -3,11 +3,8 @@ import numpy as np
 from scipy import stats
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Block
 from torch.utils.checkpoint import checkpoint
 from transformers import AutoImageProcessor, ViTMAEConfig, ViTMAEForPreTraining
-
-from utils.utils import get_2d_sincos_pos_embed, patchify
     
 
 class MAE(nn.Module):
@@ -58,46 +55,37 @@ class MAE(nn.Module):
         self.encoder_std = torch.tensor(proc.image_std).view(1, 3, 1, 1)
 
         config = ViTMAEConfig.from_pretrained(mae_config)
-        config.image_size = int(img_size)
+        config.patch_size = int(patch_size)
+        config.num_channels = int(channels)
         self.model_name = mae_config
-        self.model_mae = ViTMAEForPreTraining.from_pretrained(self.model_name, config=config, ignore_mismatched_sizes=True)
+        self.model_mae = ViTMAEForPreTraining.from_pretrained(self.model_name, config=config)
+
+        # Interpolate decoder pos_embed from pretrained resolution to target resolution
+        pretrain_num_patches = (config.image_size // patch_size) ** 2
+        if self.seq_len != pretrain_num_patches:
+            old_pos = self.model_mae.decoder.decoder_pos_embed.data  # [1, 1+old_patches, D]
+            cls_pos = old_pos[:, :1, :]
+            patch_pos = old_pos[:, 1:, :]
+            grid_old = int(pretrain_num_patches ** 0.5)
+            grid_new = img_size // patch_size
+            D = patch_pos.shape[-1]
+            patch_pos = patch_pos.reshape(1, grid_old, grid_old, D).permute(0, 3, 1, 2)
+            patch_pos = nn.functional.interpolate(
+                patch_pos.float(), size=(grid_new, grid_new), mode='bicubic', align_corners=False
+            )
+            patch_pos = patch_pos.permute(0, 2, 3, 1).reshape(1, self.seq_len, D)
+            self.model_mae.decoder.decoder_pos_embed = nn.Parameter(
+                torch.cat([cls_pos, patch_pos], dim=1), requires_grad=False
+            )
+
         for param in self.model_mae.parameters():
             param.requires_grad = False
         self.model_mae.eval()
 
         self.ema_decay=ema_decay
         self.ema_params = None
-
-
-    def initialize_weights(self):
-        def _init_weights(m):
-            if isinstance(m, nn.Linear):
-                # Xavier Uniform is standard for Transformers (often called Glorot)
-                torch.nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
-
-        self.apply(_init_weights)
-
-        grid_size = int(self.seq_len ** 0.5)
-        # pos_embed_grid = get_2d_sincos_pos_embed(self.encoder_dim, grid_size)
-        # full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.encoder_dim)
-        # full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        # self.encoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
-
-        pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.decoder_dim)
-        full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        self.decoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
-
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
-        nn.init.trunc_normal_(self.fake_latent, std=.02)
     
-    def forward_encoder(self, x, class_emb):
+    def forward_encoder(self, x):
         mask_rate = stats.truncnorm((self.min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]
         self.model_mae.config.mask_ratio = mask_rate
 
@@ -108,10 +96,11 @@ class MAE(nn.Module):
 
         return x, mask, ids_restore
     
-    def encoder_generate(self, x, orders, num_visible, class_emb):
+    def encoder_generate(self, x, orders, num_visible):
         self.model_mae.config.mask_ratio = 0
+        noise = torch.arange(self.seq_len).unsqueeze(0).expand(x.shape[0], -1).to(x.device).float()
 
-        x_embedding = self.model_mae.vit.embeddings(x)
+        x_embedding = self.model_mae.vit.embeddings(x, noise=noise, interpolate_pos_encoding=True)
         x_embedding = x_embedding[0] if isinstance(x_embedding, tuple) else x_embedding
 
         B, N, D = x_embedding.shape
@@ -150,7 +139,6 @@ class MAE(nn.Module):
     def forward(self, x, mask_orders, labels, num_visible=None):
         self.model_mae.eval()
         B, C, H, W = x.shape
-        class_embedding = self.class_emb(labels)
 
         # Pretrain MAE need a range of 0 to 1
         x = (x + 1.0) / 2.0
@@ -159,9 +147,9 @@ class MAE(nn.Module):
             x = nn.functional.interpolate(x, size=(self.img_size, self.img_size), mode='bicubic', align_corners=False)
 
         if self.training:
-            x, mask, ids_restore = self.forward_encoder(x, class_embedding)
+            x, mask, ids_restore = self.forward_encoder(x)
         else:
-            x = self.encoder_generate(x, mask_orders, num_visible, class_embedding)
+            x = self.encoder_generate(x, mask_orders, num_visible)
             mask = torch.zeros(B, self.seq_len, device=x.device)
             ids_restore = torch.argsort(mask_orders, dim=1)
             indices_to_mask = mask_orders[:, num_visible:]
@@ -170,18 +158,7 @@ class MAE(nn.Module):
         z, z_pixels = self.forward_decoder(x, ids_restore)
 
         return z, mask, z_pixels
-    
-    def random_masking(self, x, orders, min_mask_rate=0.7):
-        bsz, seq_len, embed_dim = x.shape
-        mask_rate = min_mask_rate
-        mask_rate = stats.truncnorm((min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]
-        num_masked_tokens = int(np.ceil(seq_len * mask_rate))
-        mask = torch.zeros(bsz, seq_len, device=x.device)
-        mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
-                                src=torch.ones(bsz, seq_len, device=x.device))
-        return mask
 
-    
     @torch.no_grad()
     def update_ema(self):
         ema_decay = self.ema_decay

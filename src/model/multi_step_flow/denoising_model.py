@@ -1,9 +1,8 @@
-import torch.nn.functional as F
 import torch
 import torch.nn as nn
-import math
-from utils.utils import RMSNorm
 from torch.utils.checkpoint import checkpoint
+
+from model.model_utils import Attention, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
@@ -75,10 +74,10 @@ class InContextBlock(nn.Module):
         self.mlp = SwiGLUFFN(hidden_dim, int(hidden_dim * mlp_ratio), drop=proj_drop)
 
     @torch.compile
-    def forward(self, x):     
+    def forward(self, x, feat_rope=None):     
         x = self.attn_ln(x)
 
-        x = x + self.attn(x)
+        x = x + self.attn(x, rope=feat_rope)
         x = x + self.mlp(self.mlp_ln(x))
 
         return x
@@ -105,6 +104,7 @@ class DenoisingModel(nn.Module):
         self.out_channels = channels
         self.patch_size = patch_size
         self.hidden_dim = hidden_dim
+        self.num_heads = hidden_dim // 64
         self.img_size = img_size
         self.grad_ckpt = grad_ckpt
         self.denoiser_type = denoiser_type
@@ -116,6 +116,15 @@ class DenoisingModel(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_dim)
         #self.y_embedder = nn.Embedding(num_classes + 1, hidden_dim)
         self.z_proj = nn.Linear(z_hidden_dim, hidden_dim)
+
+        # rope
+        half_head_dim = self.hidden_dim // self.num_heads  // 2
+        hw_seq_len = img_size // patch_size
+        self.feat_rope = VisionRotaryEmbeddingFast(
+            dim=half_head_dim,
+            pt_seq_len=hw_seq_len,
+            num_cls_token=0
+        )
 
         if denoiser_type == 'in_context':
             self.blocks = nn.ModuleList([
@@ -210,7 +219,6 @@ class DenoisingModel(nn.Module):
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
-    @torch.compile
     def forward_in_context(self, x, z, t, y):
         """
         x: (B*N, D)
@@ -235,14 +243,13 @@ class DenoisingModel(nn.Module):
                 x = checkpoint(block, x)
         else:
             for block in self.blocks:
-                x = block(x)
+                x = block(x, self.feat_rope)
 
         x = x[:, 0, :]
         x = self.final_layer(x)
 
         return x
     
-    @torch.compile
     def forward_ada_ln(self, x, z, t, y):
         """
         x: (B*N, D)
@@ -278,110 +285,5 @@ class DenoisingModel(nn.Module):
             raise NotImplementedError
         return x
 
-class SwiGLUFFN(nn.Module):
-    def __init__(
-        self,
-        dim: int,
-        hidden_dim: int,
-        drop=0.0,
-        bias=True
-    ) -> None:
-        super().__init__()
-        hidden_dim = int(hidden_dim * 2 / 3)
-        self.w12 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
-        self.w3 = nn.Linear(hidden_dim, dim, bias=bias)
-        self.ffn_dropout = nn.Dropout(drop)
-
-    def forward(self, x):
-        x12 = self.w12(x)
-        x1, x2 = x12.chunk(2, dim=-1)
-        hidden = F.silu(x1) * x2
-        return self.w3(self.ffn_dropout(hidden))
-    
-def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
-
-    with torch.cuda.amp.autocast(enabled=False):
-        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
-
-class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
-        super().__init__()
-        self.num_heads = num_heads
-        head_dim = dim // num_heads
-
-        self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
-
-        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
-        self.proj = nn.Linear(dim, dim)
-        self.proj_drop = nn.Dropout(proj_drop)
-
-    def forward(self, x, rope = None):
-        B, N, C = x.shape
-        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-
-        if rope is not None:
-            q = rope(q)
-            k = rope(k)
-
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
-
-        x = x.transpose(1, 2).reshape(B, N, C)
-
-        x = self.proj(x)
-        x = self.proj_drop(x)
-        return x
-
-class TimestepEmbedder(nn.Module):
-    """
-    Embeds scalar timesteps into vector representations
-    """
-    def __init__(self, hidden_size, frequency_embedding_size=256):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(frequency_embedding_size, hidden_size, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_size, hidden_size, bias=True),
-        )
-        self.frequency_embedding_size = frequency_embedding_size
-
-    @staticmethod
-    def timestep_embedding(t, dim, max_period=10000):
-        """
-        Create sinusoidal timestep embeddings.
-        :param t: a 1-D Tensor of N indices, one per batch element.
-                          These may be fractional.
-        :param dim: the dimension of the output.
-        :param max_period: controls the minimum frequency of the embeddings.
-        :return: an (N, D) Tensor of positional embeddings.
-        """
-        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
-        half = dim // 2
-        freqs = torch.exp(
-            -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32) / half
-        ).to(device=t.device)
-        args = t[:, None].float() * freqs[None]
-        embedding = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
-        if dim % 2:
-            embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
-        return embedding
-
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
-        t_emb = self.mlp(t_freq)
-        return t_emb
-    
 
 

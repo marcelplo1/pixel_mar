@@ -3,6 +3,7 @@ import copy
 import os
 import random
 import shutil
+import time
 import cv2
 from scipy import stats
 from torchvision import transforms
@@ -43,7 +44,6 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
 
         mae_single.update_ema()
         denoiser_single.update_ema()
-
 
         optimizer_step = step + epoch*len(dataloader)
         if local_rank == 0:
@@ -129,7 +129,13 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
 
     num_steps = args.num_images // (args.gen_batch_size * world_size) + 1
     bsz = args.gen_batch_size
+    used_time = 0
+    gen_img_cnt = 0
     for step in range(num_steps):
+        seed = args.seed + step
+        torch.manual_seed(seed)
+        np.random.seed(seed)
+
         start_idx = world_size * bsz * step + local_rank * bsz
         end_idx = start_idx + bsz
         labels_gen = class_label_gen_world[start_idx:end_idx]
@@ -137,15 +143,28 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
         
         torch.distributed.barrier()
 
-        sampled_images = sample(args, mae, denoiser, labels_gen, device, model_params, sampler_params)
-        sampled_images = (sampled_images + 1) / 2
+        torch.cuda.synchronize()
+        start_time = time.time()
+
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            sampled_images = sample(args, mae, denoiser, labels_gen, device, model_params, sampler_params)
+
+        if step >= 1:
+            torch.cuda.synchronize()
+            used_time += time.time() - start_time
+            gen_img_cnt += bsz
+            print("Generating {} images takes {:.5f} seconds, {:.5f} sec per image".format(gen_img_cnt, used_time, used_time / gen_img_cnt))
+
+        torch.distributed.barrier()
+        
         sampled_images = sampled_images.detach().cpu()
+        sampled_images = (sampled_images + 1) / 2
 
         for b_id in range(sampled_images.size(0)):
             img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
             if img_id >= args.num_images:
                 break
-            gen_img = np.round(np.clip( sampled_images[b_id].numpy().transpose([1, 2, 0]) * 255, 0, 255))
+            gen_img = np.round(np.clip( sampled_images[b_id].float().numpy().transpose([1, 2, 0]) * 255, 0, 255))
             gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
             cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
 

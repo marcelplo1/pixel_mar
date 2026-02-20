@@ -1,13 +1,12 @@
 import math
 import numpy as np
+from model.model_utils import get_2d_sincos_pos_embed
 from scipy import stats
 import torch
 import torch.nn as nn
 from timm.models.vision_transformer import Block
 from torch.utils.checkpoint import checkpoint
 from transformers import ViTMAEConfig, ViTMAEForPreTraining
-
-from utils.utils import get_2d_sincos_pos_embed, patchify
     
 
 class MAE(nn.Module):
@@ -71,11 +70,10 @@ class MAE(nn.Module):
 
         # Important that this is AFTER the initialize
         config = ViTMAEConfig.from_pretrained(mae_config)
-        config.image_size = int(img_size)
         config.patch_size = int(patch_size)
         config.num_channels = int(channels)
         self.model_name = mae_config
-        self.encoder_mae = ViTMAEForPreTraining.from_pretrained(self.model_name, config=config, ignore_mismatched_sizes=True).vit
+        self.encoder_mae = ViTMAEForPreTraining.from_pretrained(self.model_name, config=config).vit
         for param in self.encoder_mae.parameters():
             param.requires_grad = False
         self.encoder_mae.eval()
@@ -94,11 +92,6 @@ class MAE(nn.Module):
         self.apply(_init_weights)
 
         grid_size = int(self.seq_len ** 0.5)
-        # pos_embed_grid = get_2d_sincos_pos_embed(self.encoder_dim, grid_size)
-        # full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.encoder_dim)
-        # full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        # self.encoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
-
         pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
         full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.decoder_dim)
         full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
@@ -121,9 +114,9 @@ class MAE(nn.Module):
     
     def encoder_generate(self, x, orders, num_visible, class_emb):
         self.encoder_mae.config.mask_ratio = 0
-        #noise = torch.arange(self.seq_len).unsqueeze(0).expand(x.shape[0],-1).to(x.device).to(x.dtype)
 
-        x_embedding = self.encoder_mae.embeddings(x)
+        noise = torch.arange(self.seq_len).unsqueeze(0).expand(x.shape[0], -1).to(x.device).float()
+        x_embedding = self.encoder_mae.embeddings(x, noise=noise, interpolate_pos_encoding=True)
         x_embedding = x_embedding[0] if isinstance(x_embedding, tuple) else x_embedding
 
         B, N, D = x_embedding.shape
@@ -134,7 +127,7 @@ class MAE(nn.Module):
 
         x = torch.cat([cls_token, x], dim=1)
         output = self.encoder_mae.encoder(x)
-        return output.last_hidden_state
+        return self.encoder_mae.layernorm(output.last_hidden_state)
     
     def forward_decoder(self, x, ids_restore):
         x = self.decoder_embed(x)
@@ -183,11 +176,6 @@ class MAE(nn.Module):
             ids_restore = torch.argsort(mask_orders, dim=1)
             indices_to_mask = mask_orders[:, num_visible:]
             mask.scatter_(1, indices_to_mask.long(), 1.0)
-            # x = self.encoder_generate(x, mask_orders, num_visible, class_embedding)
-            # mask = torch.zeros(B, self.seq_len, device=x.device)
-            # ids_restore = mask_orders 
-            # indices_to_mask = mask_orders[:, num_visible:]
-            # mask.scatter_(1, indices_to_mask.long(), 1.0)
 
         buffer_tokens = torch.zeros(B, self.buffer_size, x.shape[2], device=x.device)
         x = x[:, 1:, :]
@@ -216,7 +204,6 @@ class MAE(nn.Module):
                                 src=torch.ones(bsz, seq_len, device=x.device))
         return mask
 
-    
     @torch.no_grad()
     def update_ema(self):
         ema_decay = self.ema_decay
