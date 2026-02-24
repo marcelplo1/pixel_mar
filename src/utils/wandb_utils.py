@@ -19,7 +19,7 @@ def generate_run_id(exp_name):
 
 def initialize_wandb(args, entity, exp_name, project_name):
     config_dict = namespace_to_dict(args)
-    wandb.login(key=os.environ["WANDB_KEY"])
+    os.environ["WANDB_API_KEY"] = os.environ["WANDB_KEY"]
     wandb.init(
         entity=entity,
         project=project_name,

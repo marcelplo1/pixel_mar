@@ -10,12 +10,11 @@ from torchvision import datasets, transforms
 import torch.distributed as dist
 import copy
 
-from model.denoiser import Denoiser
-from model.denoising_model import DenoisingModel
-from model.mae_v2 import MAE
+from model.multi_step_flow.denoiser import Denoiser
+from model.multi_step_flow.denoising_model import DenoisingModel
 from utils import ddp
 from utils.configs_utils import parse_configs
-from utils.utils import center_crop_arr, save_plot, write_csv
+from utils.utils import center_crop_arr, save_plot, write_csv, ImageNetLMDB
 from train_eval import calc_val_loss, evaluate, train_one_epoch
 from utils.wandb_utils import initialize_wandb
 
@@ -29,9 +28,8 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
-    parser.add_argument('--grad_checkpointing', action='store_true')
-    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser")
-    parser.add_argument("--mae_type", type=str, default="freezed_encoder", help="Type of the denoiser")
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context"])
+    parser.add_argument("--mae_type", type=str, default="end_to_end", help="Type of the mae", choices=["end_to_end", "pretrained_econder"])
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
@@ -48,18 +46,18 @@ def create_parser():
     parser.add_argument("--num_images", type=int, default=50000, help="Number of images to generate during evaluation")
     parser.add_argument("--online_eval_freq", type=int, default=25, help="Frequency of online evaluation during training")
     parser.add_argument("--remove_ema", action="store_true", help="Use exponential moving average for the model parameters")
-    parser.add_argument("--cfg_scale", type=int, default=1.0, help="Classifier-free guidance factor")
-    parser.add_argument("--cfg_min", type=int, default=0.1, help="Classifier-free guidance minimum")
-    parser.add_argument("--cfg_max", type=int, default=1.0, help="Classifier-free guidance maximum")
+    parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-free guidance scale (1.0 = no guidance)")
+    parser.add_argument("--cfg_schedule", type=str, default="linear", choices=["linear", "constant"], help="CFG schedule over AR steps")
 
     # Dataset
     parser.add_argument("--class_num", type=int, default=1000, help="Number of classes in the dataset")
     parser.add_argument("--has_fixed_target_class", action="store_true", help="Whether to use a fixed target class for training")
     parser.add_argument("--fixed_target_class", type=int, default=0, help="Fix the target class to train on")
     parser.add_argument("--data_path", type=str, default="./data/imagenet", help="Path to the imagenet train dataset")
+    parser.add_argument("--dataset_type", type=str, default="imagefolder", help="Dataset format", choices=["lmdb", "imagefolder"])
     parser.add_argument("--fid_statistics", action="store_true", help="Use online FID calculation")
     parser.add_argument("--fid_statistics_path", type=str, default="./fid_stats/adm_in256_stats_full.npz", help="Path to fid statistic file")
-
+    
     # Wandb
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_entity", type=str, default="tuebingen_diffusion")
@@ -105,28 +103,32 @@ def main():
 
     transform = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(), 
+        #transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
 
-    dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
-    val_dataset = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform)
+    if args.dataset_type == 'lmdb':
+        dataset = ImageNetLMDB(os.path.join(args.data_path, 'imagenet_train.lmdb'), transform=transform)
+        val_dataset = ImageNetLMDB(os.path.join(args.data_path, 'imagenet_val.lmdb'), transform=transform)
+    elif args.dataset_type == 'imagefolder':
+        dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
+        val_dataset = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform)
 
     if args.has_fixed_target_class:
         targets = torch.tensor(dataset.targets)
         indices = (targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
         dataset = Subset(dataset, indices)
 
-        val_indices = (torch.tensor(val_dataset.targets) == args.fixed_target_class).nonzero(as_tuple=True)[0]
+        val_targets = torch.tensor(val_dataset.targets)
+        val_indices = (val_targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
         val_dataset = Subset(val_dataset, val_indices)
 
         if len(dataset) == 0:
             print("Fixed dataset class not found!")
             return
-         
         print(f"Filtered dataset to class {args.fixed_target_class}. New size: {len(dataset)}")
-        
+
     sampler_train = DistributedSampler(
         dataset, num_replicas=world_size, rank=global_rank, shuffle=True
     )
@@ -135,14 +137,20 @@ def main():
         val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False
     )
 
-    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler_train, 
-                            num_workers=8, pin_memory=True, persistent_workers=True)
-    
-    dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, sampler=sampler_val, 
-                            num_workers=8, pin_memory=True, persistent_workers=True
+    num_workers = 4
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler_train,
+                            num_workers=num_workers, pin_memory=True, persistent_workers=True)
+
+    dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, sampler=sampler_val,
+                            num_workers=num_workers, pin_memory=True, persistent_workers=True
     )
     
     # Load MAE from config file
+    if args.mae_type == 'end_to_end':
+        from model.mae import MAE
+    elif args.mae_type == 'pretrained_econder':
+        from model.mae_pretrained_encoder import MAE
+
     mae = MAE(
         img_size=args.img_size,
         patch_size=args.patch_size,
@@ -159,7 +167,6 @@ def main():
         buffer_size=mae_params.get('buffer_size', 64),
         min_mask_rate=mae_params.get('min_mask_rate', 0.7),
         num_classes=args.class_num,
-        grad_ckpt=args.grad_checkpointing,
         lable_dropout=args.label_drop_prob,
         mae_config=mae_params.get('mae_config', None)
     ).to(device)
@@ -174,7 +181,6 @@ def main():
         dropout=denoiser_params.get('dropout', 0.1),
         z_hidden_dim=mae_params.get('decoder_dim', 768),
         num_classes=args.class_num,
-        grad_ckpt=args.grad_checkpointing,
         denoiser_type=args.denoiser_type
     )
     #Load denoiser from config file
@@ -218,16 +224,13 @@ def main():
         mae_single.load_state_dict(checkpoint['mae'])
         denoiser_single.load_state_dict(checkpoint['denoiser'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        mae_single.ema_params = checkpoint['ema_mae']
-        denoiser_single.ema_params = checkpoint['ema_denoiser']
+        mae_single.ema_params = [p.to(device) for p in checkpoint['ema_mae']]
+        denoiser_single.ema_params = [p.to(device) for p in checkpoint['ema_denoiser']]
 
         args.start_epoch = checkpoint.get('epoch', 0)
 
         if 'model_config' in checkpoint and model_config != checkpoint['model_config']:
             print("Model config loaded from checkpoint is different")
-            return
-        if 'sampler_config' in checkpoint and sampler_config != checkpoint['sampler_config']:
-            print("Sampler config loaded from checkpoint is different")
             return
 
         print("Loaded epoch: {}".format(checkpoint.get('epoch', None)))

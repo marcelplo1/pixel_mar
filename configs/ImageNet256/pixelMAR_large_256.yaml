@@ -9,13 +9,13 @@ model:
     t_eps: 1.0e-2
     sample_t_mean: -0.8
     sample_t_std: 0.8
-    diffusion_batch_mul: 4
+    diffusion_batch_mul: 1
     pred_type: 'x'  
   mae_params:
     mae_config: facebook/vit-mae-large
     encoder_dim: 1024
     encoder_depth: 24
-    encoder_num_heads: 12
+    encoder_num_heads: 16
     decoder_dim: 512
     decoder_depth: 12
     decoder_num_heads: 8
@@ -30,9 +30,9 @@ model:
 
 sampler:
   method: 'heun'
-  num_generation_passes: 2 
+  num_generation_passes: 1 
   t_eps_sample: 1.0e-5
-  num_ar_steps: 32
+  num_ar_steps: 64
   num_timesteps: 50
   noise_scale: 1.0
 

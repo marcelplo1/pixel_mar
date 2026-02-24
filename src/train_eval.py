@@ -1,5 +1,5 @@
 from collections import defaultdict
-import copy
+
 import os
 import random
 import shutil
@@ -18,22 +18,24 @@ from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_a
 
 def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, optimizer, device):
     mae.train()
-    denoiser.train()    
+    denoiser.train()
 
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
-    
-    for step, (samples, labels) in enumerate(dataloader):
+
+    for step, batch in enumerate(dataloader):
         adjust_learning_rate(optimizer, step / len(dataloader) + epoch, args)
+
+        samples, labels = batch
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-
         x = patchify(samples, args.patch_size)
         x_gt = x.clone().detach()
-        orders = sample_order(x.shape[0], x.shape[1], device)
+
+        orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            z, mask, z_pixels = mae(samples, orders, labels)
+            z, mask = mae(samples, orders, labels)
             loss = denoiser(x_gt, z, mask, labels)
 
         optimizer.zero_grad()
@@ -53,7 +55,7 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
                     "train/lr": optimizer.param_groups[0]['lr'],
                 }
                 log(stats, step=optimizer_step)
-        
+
     print(f"Epoch {epoch+1}/{args.epochs}, Loss: {np.mean(loss.item()):.4f}")
     return optimizer_step
 
@@ -63,15 +65,16 @@ def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     losses = []
-    for step, (samples, labels) in enumerate(val_dataloader):
+    for step, batch in enumerate(val_dataloader):
+        samples, labels = batch
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-
-        x = patchify(samples, mae.patch_size)
+        x = patchify(samples, args.patch_size)
         x_gt = x.clone().detach()
-        orders = sample_order(x.shape[0], x.shape[1], device)
 
-        z, mask, z_pixels = mae(samples, orders, labels)
+        orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
+
+        z, mask = mae(samples, orders, labels)
         loss = denoiser(x_gt, z, mask, labels)
         losses.append(loss.item())
 
@@ -82,7 +85,7 @@ def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
                 "epoch" : epoch
             }
             log(stats)
-            
+
     torch.distributed.barrier()
 
 def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=None, metrics=None):
@@ -103,22 +106,12 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
         os.makedirs(class_folder, exist_ok=True)
         os.makedirs(save_folder_fid, exist_ok=True)
 
-    if args.remove_ema == False: 
-        mae_state_dict = copy.deepcopy(mae.state_dict())
-        mae_ema_state_dict = copy.deepcopy(mae.state_dict())
-        for i, (name, _value) in enumerate(mae.named_parameters()):
-            assert name in mae_ema_state_dict
-            mae_ema_state_dict[name] = mae.ema_params[i]
-
-        denoiser_state_dict = copy.deepcopy(denoiser.state_dict())
-        denoiser_ema_state_dict = copy.deepcopy(denoiser.state_dict())
-        for i, (name, _value) in enumerate(denoiser.named_parameters()):
-            assert name in denoiser_ema_state_dict
-            denoiser_ema_state_dict[name] = denoiser.ema_params[i]
-        
+    if args.remove_ema == False:
         print("Switch to ema")
-        mae.load_state_dict(mae_ema_state_dict)
-        denoiser.load_state_dict(denoiser_ema_state_dict)
+        for i, p in enumerate(mae.parameters()):
+            mae.ema_params[i], p.data = p.data.clone(), mae.ema_params[i]
+        for i, p in enumerate(denoiser.parameters()):
+            denoiser.ema_params[i], p.data = p.data.clone(), denoiser.ema_params[i]
 
     assert args.num_images % args.class_num == 0, "Number of images per class must be the same"
     if args.has_fixed_target_class:
@@ -187,8 +180,11 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
 
     if args.remove_ema == False:
         print("Switch back from ema")
-        mae.load_state_dict(mae_state_dict)
-        denoiser.load_state_dict(denoiser_state_dict)
+        for i, p in enumerate(mae.parameters()):
+            mae.ema_params[i], p.data = p.data.clone(), mae.ema_params[i]
+        for i, p in enumerate(denoiser.parameters()):
+            denoiser.ema_params[i], p.data = p.data.clone(), denoiser.ema_params[i]
+        torch.cuda.empty_cache()
 
     # Evaluate the generation quality
     if args.fid_statistics:

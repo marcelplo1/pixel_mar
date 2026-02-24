@@ -8,33 +8,43 @@ def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
 class ResBlock(nn.Module):
-    def __init__(
-        self,
-        hidden_dim,
-    ):
+    """ada_ln block: SwiGLU 4x MLP, input injection, non-zero gate init."""
+    def __init__(self, hidden_dim, depth_index, total_depth):
         super().__init__()
         self.hidden_dim = hidden_dim
 
         self.in_ln = RMSNorm(hidden_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-            nn.SiLU(),
-            nn.Linear(hidden_dim, hidden_dim, bias=True),
-        )
+        self.mlp = SwiGLUFFN(hidden_dim, int(hidden_dim * 4))
 
+        # Input injection: project x0 into this block
+        self.x0_proj = nn.Linear(hidden_dim, hidden_dim, bias=True)
+
+        # adaLN: shift, scale, gate
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_dim, 3 * hidden_dim, bias=True)
         )
 
+        # Non-zero gate init bias
+        self._gate_init_bias = 1.0 / total_depth
+        self._depth_index = depth_index
+
+    def initialize_gate_bias(self):
+        """Call after _basic_init to set non-zero gate bias."""
+        # Gate is the 3rd chunk of the adaLN output
+        with torch.no_grad():
+            bias = self.adaLN_modulation[-1].bias
+            # shift and scale biases stay at 0, gate bias = 1/depth
+            bias[2 * self.hidden_dim:].fill_(self._gate_init_bias)
+
     @torch.compile
-    def forward(self, x, c_token):        
+    def forward(self, x, c_token, x0):
         shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c_token).chunk(3, dim=-1)
-        h = modulate(self.in_ln(x), shift_mlp, scale_mlp)
+        h = x + self.x0_proj(x0)
+        h = modulate(self.in_ln(h), shift_mlp, scale_mlp)
         h = self.mlp(h)
-        #return x + gate_mlp * h
         return gate_mlp * h
-    
+
 class FinalLayer(nn.Module):
     """
     The final layer with a possible bottleneck layer
@@ -96,8 +106,7 @@ class DenoisingModel(nn.Module):
         depth=6,
         dropout=0.0,
         z_hidden_dim=768,
-        grad_ckpt = False,
-        denoiser_type = 'in_context'
+        denoiser_type = 'ada_ln'
     ):
         super().__init__()
         self.in_channels = channels
@@ -106,7 +115,6 @@ class DenoisingModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.num_heads = hidden_dim // 64
         self.img_size = img_size
-        self.grad_ckpt = grad_ckpt
         self.denoiser_type = denoiser_type
 
         self.embedding_dim = channels * patch_size**2
@@ -114,32 +122,22 @@ class DenoisingModel(nn.Module):
 
         self.x_proj = nn.Linear(self.embedding_dim, hidden_dim)
         self.t_embedder = TimestepEmbedder(hidden_dim)
-        #self.y_embedder = nn.Embedding(num_classes + 1, hidden_dim)
         self.z_proj = nn.Linear(z_hidden_dim, hidden_dim)
 
-        # rope
-        half_head_dim = self.hidden_dim // self.num_heads  // 2
-        hw_seq_len = img_size // patch_size
-        self.feat_rope = VisionRotaryEmbeddingFast(
-            dim=half_head_dim,
-            pt_seq_len=hw_seq_len,
-            num_cls_token=0
-        )
-
-        if denoiser_type == 'in_context':
+        if denoiser_type == 'ada_ln':
+            self.blocks = nn.ModuleList([
+                ResBlock(hidden_dim, depth_index=i, total_depth=depth)
+                for i in range(depth)
+            ])
+            self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
+            self.initialize_weights_ada_ln()
+        elif denoiser_type == 'in_context':
             self.blocks = nn.ModuleList([
                 InContextBlock(hidden_dim, hidden_dim // 64)
                 for i in range(depth)
             ])
             self.final_layer = nn.Linear(hidden_dim, self.embedding_dim, bias=True)
             self.initialize_weights_in_context()
-        elif denoiser_type == 'ada_ln':
-            self.blocks = nn.ModuleList([
-                ResBlock(hidden_dim)
-                for i in range(depth)
-            ])
-            self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
-            self.initialize_weights_ada_ln_wo_res()
 
     def initialize_weights_in_context(self):
         # Basic Xavier initialization for all Linear layers
@@ -185,37 +183,17 @@ class DenoisingModel(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         for block in self.blocks:
+            # Zero adaLN modulation weights, then set non-zero gate bias
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            
+            # MLP (w3) keeps Xavier init — gate at 1/depth controls magnitude.
+            block.initialize_gate_bias()
 
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
-    
-    def initialize_weights_ada_ln_wo_res(self):
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
+            # Zero x0_proj so input injection starts inactive
+            nn.init.constant_(block.x0_proj.weight, 0)
+            nn.init.constant_(block.x0_proj.bias, 0)
 
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        for block in self.blocks:
-            # We use Xavier/Kaiming so the gates (gate_mlp) start with non-zero values.
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-            # Initialize MLP weights using Kaiming Normal for SiLU activation
-            for m in block.mlp.modules():
-                if isinstance(m, nn.Linear):
-                    nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
-                    if m.bias is not None:
-                        nn.init.constant_(m.bias, 0)
-                        
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
 
@@ -229,21 +207,15 @@ class DenoisingModel(nn.Module):
         x = self.x_proj(x)  
         t = self.t_embedder(t)      
         z = self.z_proj(z)
-        #y = self.y_embedder(y)
 
-        #c = t + z + y
         c = t + z
 
         c = c.unsqueeze(1)
         x = x.unsqueeze(1)
         x = torch.cat([x, c], dim=1)
 
-        if self.grad_ckpt and not torch.jit.is_scripting() and False:
-            for block in self.blocks:
-                x = checkpoint(block, x)
-        else:
-            for block in self.blocks:
-                x = block(x, self.feat_rope)
+        for block in self.blocks:
+            x = block(x)
 
         x = x[:, 0, :]
         x = self.final_layer(x)
@@ -254,33 +226,26 @@ class DenoisingModel(nn.Module):
         """
         x: (B*N, D)
         z: (B*N, D')
-        y: (B*N, Cls_num)
         t: (B*N, 1)
         """
-        x = self.x_proj(x)  
-        t = self.t_embedder(t)      
-        z = self.z_proj(z)
-        #y = self.y_embedder(y)
 
-        #c = t + z + y
+        x0 = x  # save for input injection
+        x = self.x_proj(x)
+        t = self.t_embedder(t)
+        z = self.z_proj(z)
         c = t + z
 
-        if self.grad_ckpt and not torch.jit.is_scripting() and False:
-            for block in self.blocks:
-                x = checkpoint(block, x, c)
-        else:
-            for block in self.blocks:
-                x = block(x, c)
+        for block in self.blocks:
+            x = block(x, c, x0)
 
         x = self.final_layer(x, c)
-
         return x
-    
+
     def forward(self, x, z, t, y):
-        if self.denoiser_type == 'in_context':
-            x = self.forward_in_context(x, z, t, y)
-        elif self.denoiser_type == 'ada_ln':
+        if self.denoiser_type == 'ada_ln':
             x = self.forward_ada_ln(x, z, t, y)
+        elif self.denoiser_type == 'in_context':
+            x = self.forward_in_context(x, z, t, y)
         else:
             raise NotImplementedError
         return x

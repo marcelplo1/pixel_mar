@@ -28,7 +28,6 @@ class MAE(nn.Module):
             dropout=0.1, 
             buffer_size=64,
             min_mask_rate = 0.7,
-            grad_ckpt = False,
             lable_dropout = 0.1,
             mae_config = None
         ):
@@ -43,13 +42,6 @@ class MAE(nn.Module):
         self.channels = channels
         self.seq_len = (img_size // patch_size) ** 2
         self.embed_dim = channels * patch_size**2
-        self.grad_ckpt = grad_ckpt
-
-        # self.encoder_proj = nn.Sequential(
-        #     nn.Linear(self.embed_dim, bottleneck_dim),
-        #     nn.SiLU(),
-        #     nn.Linear(bottleneck_dim, hidden_dim)
-        # )
 
         self.x_proj = nn.Linear(self.embed_dim, self.encoder_dim, bias=True)
         self.x_ln = nn.LayerNorm(encoder_dim, eps=1e-6)
@@ -145,7 +137,7 @@ class MAE(nn.Module):
         buffer_tokens = torch.zeros(bsz, self.buffer_size, embed_dim, device=x.device)
         x = torch.cat([buffer_tokens, x], dim=1)
 
-        if self.training: #TODO apply label dropping together with denoiser
+        if self.training:
             drop_latent_mask = torch.rand(bsz) < self.label_drop_prob
             drop_latent_mask = drop_latent_mask.unsqueeze(-1).cuda().to(x.dtype)
             class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_emb
@@ -194,9 +186,7 @@ class MAE(nn.Module):
         decoded = decoded[:, self.buffer_size:]
 
         return decoded
-    
-    
-
+        
     def forward(self, x, mask_orders, labels, num_visible=None):
         x = patchify(x, self.patch_size)
         B, N, D = x.shape
@@ -216,10 +206,9 @@ class MAE(nn.Module):
             
             x = self.encoder_generate(x, mask_orders, num_visible, class_embedding)
 
-        # 2. Decode using the unified shuffle/restore logic
         z = self.forward_decoder(x, ids_restore)
 
-        return z, mask, None
+        return z, mask
     
     def random_masking(self, x, orders, min_mask_rate=0.7):
         bsz, seq_len, embed_dim = x.shape
@@ -231,7 +220,6 @@ class MAE(nn.Module):
                                 src=torch.ones(bsz, seq_len, device=x.device))
         return mask
 
-    
     @torch.no_grad()
     def update_ema(self):
         ema_decay = self.ema_decay

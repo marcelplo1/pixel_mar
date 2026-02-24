@@ -4,8 +4,12 @@ import cv2
 import torch
 import math
 import numpy as np
+import io
+import lmdb
+import pickle
 import matplotlib.pyplot as plt
 import torch.nn as nn
+from torch.utils.data import Dataset
 from PIL import Image 
 
 
@@ -131,3 +135,57 @@ def write_csv(name, path, list):
         writer = csv.writer(f)
         for item in list:
             writer.writerow([item])
+
+class ImageNetLMDB(Dataset):
+    def __init__(self, db_path, transform=None):
+        self.db_path = db_path
+        self.transform = transform
+        
+        # Open the environment once to get the number of entries
+        env = lmdb.open(db_path, readonly=True, lock=False, readahead=False, meminit=False)
+        with env.begin(write=False) as txn:
+            # txn.stat()['entries'] counts all keys including metadata.
+            # Use the 'length' metadata key if available, otherwise find
+            # the actual number of sequential integer keys.
+            length_val = txn.get(b'length') or txn.get(b'num_samples')
+            if length_val is not None:
+                self.length = int(length_val)
+            else:
+                # Binary search for the last valid integer key
+                lo, hi = 0, txn.stat()['entries']
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if txn.get(str(mid).encode('ascii')) is not None:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                self.length = lo
+        env.close()
+        
+        self.env = None
+
+    def _init_db(self):
+        """Initializes the LMDB environment for each worker process."""
+        self.env = lmdb.open(self.db_path, readonly=True, lock=False, readahead=False, meminit=False)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, index):
+        if self.env is None:
+            self._init_db()
+
+        with self.env.begin(write=False) as txn:
+            byte_key = str(index).encode('ascii')
+            byteflow = txn.get(byte_key)
+
+        if byteflow is None:
+            raise KeyError(f"Key {index} not found in LMDB")
+
+        data = pickle.loads(byteflow)
+        img = Image.open(io.BytesIO(data['image'])).convert('RGB')
+        label = data['label']
+
+        if self.transform is not None:
+            img = self.transform(img)
+        return img, label

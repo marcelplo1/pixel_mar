@@ -22,6 +22,9 @@ def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
     noise_scale = model_params.get('noise_scale', 1.0)
     num_ar_steps = sampler_params.get('num_ar_steps', 64)
 
+    cfg_scale = getattr(args, 'cfg_scale', 1.0)
+    cfg_schedule = getattr(args, 'cfg_schedule', 'linear')
+
     seq_len = (img_size// patch_size) ** 2
     embed_dim = (patch_size ** 2) * channels
 
@@ -38,7 +41,20 @@ def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
 
             # In refinement passes, MAE sees the full image for better context
             mae_num_visible = seq_len if pass_idx > 0 else num_visible
-            z, mask, _ = mae(tokens, orders, labels, mae_num_visible)
+
+            if cfg_scale != 1.0:
+                # CFG: run MAE conditionally and unconditionally, combine z
+                z_cond, mask = mae(tokens, orders, labels, mae_num_visible)
+                z_uncond, _ = mae(tokens, orders, labels, mae_num_visible, force_unconditional=True)
+
+                if cfg_schedule == "linear":
+                    cfg_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
+                else:  # constant
+                    cfg_iter = cfg_scale
+
+                z = z_uncond + cfg_iter * (z_cond - z_uncond)
+            else:
+                z, mask = mae(tokens, orders, labels, mae_num_visible)
 
             mask_ratio = np.cos(math.pi / 2. * (i + 1) / num_ar_steps)
             mask_len = int(np.floor(seq_len * mask_ratio))
