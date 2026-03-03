@@ -5,10 +5,11 @@ model:
     img_size: 64
     patch_size: 4
     in_channels: 3
-    ema_decay: 0.9995
-    t_eps: 1.0e-2
-    sample_t_mean: -0.8
-    sample_t_std: 0.8
+    ema_decay: 0.9999
+    t_eps: 5.0e-2
+    sample_t_mean: 0.0
+    sample_t_std: 1.0
+    time_shift_base: 4096
     diffusion_batch_mul: 4
     pred_type: 'x'  
   mae_params:
@@ -23,15 +24,16 @@ model:
     buffer_size: 64
     mask_ratio_min: 0.7
   denoiser_params:
-    hidden_dim: 1024
-    depth: 6
+    hidden_dim: 768
+    depth: 3
     dropout: 0.1
 
 sampler:
-  method: 'heun'
-  t_eps_sample: 1.0e-5
+  method: 'euler'
+  t_eps_sample: 1.0e-4
+  num_generation_passes: 1 
   num_ar_steps: 16
-  num_timesteps: 50
+  num_timesteps: 100
   noise_scale: 1.0
 
 

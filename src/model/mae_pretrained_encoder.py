@@ -1,15 +1,29 @@
 import numpy as np
-from model.model_utils import get_2d_sincos_pos_embed
+from model.model_utils import Attention, RMSNorm, SwiGLUFFN, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
 from scipy import stats
 import torch
 import torch.nn as nn
-from timm.models.vision_transformer import Block
 from transformers import ViTMAEConfig, ViTMAEForPreTraining
 
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
+class Block(nn.Module):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
+        super().__init__()
+        self.norm1 = RMSNorm(hidden_size, eps=1e-6)
+        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
+                              attn_drop=attn_drop, proj_drop=proj_drop)
+        self.norm2 = RMSNorm(hidden_size, eps=1e-6)
+        mlp_hidden_dim = int(hidden_size * mlp_ratio)
+        self.mlp = SwiGLUFFN(hidden_size, mlp_hidden_dim, drop=proj_drop)
+
+    @torch.compile
+    def forward(self, x, feat_rope=None):
+        x = x + self.attn(self.norm1(x), rope=feat_rope)
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 class MAE(nn.Module):
     def __init__(
@@ -49,9 +63,12 @@ class MAE(nn.Module):
 
         self.decoder_embed = nn.Linear(self.encoder_dim, self.decoder_dim, bias=True)
         self.decoder_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len + self.buffer_size, decoder_dim),  requires_grad=True)
+        
         self.decoder_block = nn.ModuleList([
-            Block(decoder_dim, decoder_num_heads, mlp_ratio, qkv_bias=True, norm_layer=nn.LayerNorm,
-                  proj_drop=dropout, attn_drop=dropout) for _ in range(decoder_depth)])
+            Block(self.decoder_dim, decoder_num_heads, mlp_ratio=mlp_ratio,
+                     attn_drop=dropout, proj_drop=dropout)
+            for i in range(decoder_depth)
+        ])
         self.decoder_norm = nn.LayerNorm(decoder_dim, eps=1e-6)
 
         self.label_drop_prob = lable_dropout
@@ -61,6 +78,15 @@ class MAE(nn.Module):
         self.ema_params = None
 
         self.initialize_weights()
+
+        # rope
+        half_head_dim = self.decoder_dim // decoder_num_heads // 2
+        hw_seq_len = self.img_size // patch_size
+        self.feat_rope = VisionRotaryEmbeddingFast(
+            dim=half_head_dim,
+            pt_seq_len=hw_seq_len,
+            num_cls_token=self.buffer_size
+        )
 
         # Frozen pretrained encoder (after initialize_weights to avoid overwriting)
         config = ViTMAEConfig.from_pretrained(mae_config)
@@ -122,7 +148,6 @@ class MAE(nn.Module):
         output = self.encoder_mae.encoder(x)
         return self.encoder_mae.layernorm(output.last_hidden_state)
 
-    @torch.compile
     def forward_decoder(self, x, ids_restore):
         x = self.decoder_embed(x)
 
@@ -137,9 +162,8 @@ class MAE(nn.Module):
         x = torch.cat([x_buffer, x_full], dim=1)
 
         x = x + self.decoder_pos_emb
-
-        for block in self.decoder_block:
-            x = block(x)
+        for i, block in enumerate(self.decoder_block):
+            x = block(x, self.feat_rope)
 
         decoded = self.decoder_norm(x)
         decoded = decoded[:, self.buffer_size:]

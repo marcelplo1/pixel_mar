@@ -63,21 +63,8 @@ class TimestepEmbedder(nn.Module):
         t_emb = self.mlp(t_freq)
         return t_emb
     
-def scaled_dot_product_attention(query, key, value, dropout_p=0.0) -> torch.Tensor:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1))
-    attn_bias = torch.zeros(query.size(0), 1, L, S, dtype=query.dtype).cuda()
-
-    with torch.cuda.amp.autocast(enabled=False):
-        attn_weight = query.float() @ key.float().transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
-
-
 class Attention(nn.Module):
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., force_float=False):
         super().__init__()
         self.num_heads = num_heads
         head_dim = dim // num_heads
@@ -86,22 +73,35 @@ class Attention(nn.Module):
         self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.attn_drop_p = attn_drop
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x, rope):
+        self.force_float = force_float
+
+    def forward(self, x, rope=None):
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
-        q, k, v = qkv[0], qkv[1], qkv[2]   # make torchscript happy (cannot use tensor as tuple)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        q = rope(q)
-        k = rope(k)
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
 
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        scale = 1.0 / math.sqrt(q.shape[-1])
+
+        if self.force_float:
+            with torch.cuda.amp.autocast(enabled=False):
+                attn = (q.float() @ k.float().transpose(-2, -1)) * scale
+        else:
+            attn = (q @ k.transpose(-2, -1)) * scale
+        attn = attn.softmax(dim=-1)
+        if self.attn_drop_p > 0 and self.training:
+            attn = F.dropout(attn, p=self.attn_drop_p, training=True)
+        x = attn @ v
 
         x = x.transpose(1, 2).reshape(B, N, C)
 
@@ -112,7 +112,7 @@ class Attention(nn.Module):
 
 class CrossAttention(nn.Module):
     """Cross-attention: Q from x, KV from conditioning tokens."""
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., force_float=False):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -125,6 +125,8 @@ class CrossAttention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        self.force_float = force_float
 
     def forward(self, x, cond):
         """
@@ -141,7 +143,16 @@ class CrossAttention(nn.Module):
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        x = scaled_dot_product_attention(q, k, v, dropout_p=self.attn_drop.p if self.training else 0.)
+        scale = 1.0 / math.sqrt(self.head_dim)
+        if self.force_float:
+            with torch.cuda.amp.autocast(enabled=False):
+                attn = (q.float() @ k.float().transpose(-2, -1)) * scale
+        else:
+            attn = (q @ k.transpose(-2, -1)) * scale
+
+        attn = attn.softmax(dim=-1)
+        attn = F.dropout(attn, p=self.attn_drop.p if self.training else 0., training=self.training)
+        x = attn @ v
 
         x = x.reshape(B, D)
         x = self.proj(x)
@@ -218,3 +229,76 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+def broadcat(tensors, dim = -1):
+    num_tensors = len(tensors)
+    shape_lens = set(list(map(lambda t: len(t.shape), tensors)))
+    assert len(shape_lens) == 1, 'tensors must all have the same number of dimensions'
+    shape_len = list(shape_lens)[0]
+    dim = (dim + shape_len) if dim < 0 else dim
+    dims = list(zip(*map(lambda t: list(t.shape), tensors)))
+    expandable_dims = [(i, val) for i, val in enumerate(dims) if i != dim]
+    assert all([*map(lambda t: len(set(t[1])) <= 2, expandable_dims)]), 'invalid dimensions for broadcastable concatentation'
+    max_dims = list(map(lambda t: (t[0], max(t[1])), expandable_dims))
+    expanded_dims = list(map(lambda t: (t[0], (t[1],) * num_tensors), max_dims))
+    expanded_dims.insert(dim, (dim, dims[dim]))
+    expandable_shapes = list(zip(*map(lambda t: t[1], expanded_dims)))
+    tensors = list(map(lambda t: t[0].expand(*t[1]), zip(tensors, expandable_shapes)))
+    return torch.cat(tensors, dim = dim)
+
+def rotate_half(x):
+    x = rearrange(x, '... (d r) -> ... d r', r = 2)
+    x1, x2 = x.unbind(dim = -1)
+    x = torch.stack((-x2, x1), dim = -1)
+    return rearrange(x, '... d r -> ... (d r)')
+
+class VisionRotaryEmbeddingFast(nn.Module):
+    def __init__(
+        self,
+        dim,
+        pt_seq_len=16,
+        ft_seq_len=None,
+        custom_freqs = None,
+        freqs_for = 'lang',
+        theta = 10000,
+        max_freq = 10,
+        num_freqs = 1,
+        num_cls_token = 0
+    ):
+        super().__init__()
+        if custom_freqs:
+            freqs = custom_freqs
+        elif freqs_for == 'lang':
+            freqs = 1. / (theta ** (torch.arange(0, dim, 2)[:(dim // 2)].float() / dim))
+        elif freqs_for == 'pixel':
+            freqs = torch.linspace(1., max_freq / 2, dim // 2) * pi
+        elif freqs_for == 'constant':
+            freqs = torch.ones(num_freqs).float()
+        else:
+            raise ValueError(f'unknown modality {freqs_for}')
+
+        if ft_seq_len is None: ft_seq_len = pt_seq_len
+        t = torch.arange(ft_seq_len) / ft_seq_len * pt_seq_len
+
+        freqs = torch.einsum('..., f -> ... f', t, freqs)
+        freqs = repeat(freqs, '... n -> ... (n r)', r = 2)
+        freqs = broadcat((freqs[:, None, :], freqs[None, :, :]), dim = -1)
+
+        if num_cls_token > 0:
+            freqs_flat = freqs.view(-1, freqs.shape[-1])  # [N_img, D]
+            cos_img = freqs_flat.cos()
+            sin_img = freqs_flat.sin()
+
+            # prepend in-context cls token
+            N_img, D = cos_img.shape
+            cos_pad = torch.ones(num_cls_token, D, dtype=cos_img.dtype)
+            sin_pad = torch.zeros(num_cls_token, D, dtype=sin_img.dtype)
+
+            self.register_buffer('freqs_cos', torch.cat([cos_pad, cos_img], dim=0), persistent=False)
+            self.register_buffer('freqs_sin', torch.cat([sin_pad, sin_img], dim=0), persistent=False)
+        else:
+            self.register_buffer('freqs_cos', freqs.cos().view(-1, freqs.shape[-1]), persistent=False)
+            self.register_buffer('freqs_sin', freqs.sin().view(-1, freqs.shape[-1]), persistent=False)
+
+    def forward(self, t): return  t * self.freqs_cos + rotate_half(t) * self.freqs_sin

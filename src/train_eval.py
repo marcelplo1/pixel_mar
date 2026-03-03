@@ -11,6 +11,7 @@ import torch
 import numpy as np
 from sample import sample
 import torch_fidelity
+from utils.logging_utils import StepTimer
 from utils.wandb_utils import log
 
 from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, unpatchify
@@ -23,37 +24,65 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
+    timer = StepTimer(log_interval=50) if args.log_parameters else None
+
     for step, batch in enumerate(dataloader):
         adjust_learning_rate(optimizer, step / len(dataloader) + epoch, args)
+
+        if timer:
+            timer.mark('step_start')
 
         samples, labels = batch
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
         x = patchify(samples, args.patch_size)
         x_gt = x.clone().detach()
-
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
+
+        if timer:
+            timer.mark('mae_start')
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             z, mask = mae(samples, orders, labels)
+
+        if timer:
+            timer.mark('mae_end')
+
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             loss = denoiser(x_gt, z, mask, labels)
+
+        if timer:
+            timer.mark('den_end')
 
         optimizer.zero_grad()
         loss.backward()
+
+        if timer:
+            timer.mark('bwd_end')
+
         optimizer.step()
 
-        torch.cuda.synchronize()
+        if timer:
+            timer.mark('opt_end')
 
         mae_single.update_ema()
         denoiser_single.update_ema()
 
+        if timer:
+            timer.mark('ema_end')
+            timer.end_step()
+
         optimizer_step = step + epoch*len(dataloader)
         if local_rank == 0:
+            if timer and timer.should_log():
+                timing_stats = timer.print_and_get_stats()
+                
+            stats = {
+                "train/loss": loss.item(),
+                "train/lr": optimizer.param_groups[0]['lr'],
+            }
+
             if args.use_wandb:
-                stats = {
-                    "train/loss": loss.item(),
-                    "train/lr": optimizer.param_groups[0]['lr'],
-                }
                 log(stats, step=optimizer_step)
 
     print(f"Epoch {epoch+1}/{args.epochs}, Loss: {np.mean(loss.item()):.4f}")
@@ -74,8 +103,9 @@ def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
 
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
 
-        z, mask = mae(samples, orders, labels)
-        loss = denoiser(x_gt, z, mask, labels)
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            z, mask = mae(samples, orders, labels)
+            loss = denoiser(x_gt, z, mask, labels)
         losses.append(loss.item())
 
     if local_rank == 0:

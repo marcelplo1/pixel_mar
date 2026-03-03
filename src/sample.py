@@ -31,7 +31,7 @@ def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
     cur_tokens = torch.zeros(bsz, seq_len, embed_dim, device=device)
     orders = sample_order(bsz, seq_len, device)
     
-    num_generation_passes = sampler_params.get('num_generation_passes', 2)
+    num_generation_passes = sampler_params.get('num_generation_passes', 1)
     xt_global = noise_scale * torch.randn(bsz, seq_len, embed_dim, device=device)
     for pass_idx in range(num_generation_passes):
         num_visible = 0

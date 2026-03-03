@@ -1,4 +1,5 @@
 import os
+import math
 import numpy as np
 import torch
 import torch.nn as nn
@@ -21,7 +22,8 @@ class Denoiser(nn.Module):
         t_eps_sample = 1e-5,
         noise_scale = 1.0,
         ema_decay = 0.9999,
-        use_logging=False
+        use_logging=False,
+        time_shift_base=None
     ):
         super().__init__()
 
@@ -46,13 +48,32 @@ class Denoiser(nn.Module):
         self.ema_decay = ema_decay
         self.diffusion_batch_mul = diffusion_batch_mul
 
+        # Dimension-dependent time shift
+        if time_shift_base is not None:
+            shift_dim = self.channels * self.patch_size ** 2
+            self.time_dist_shift = math.sqrt(shift_dim / time_shift_base)
+        else:
+            self.time_dist_shift = None
+
+        #self.snr_gamma = 5.0
+        self.snr_gamma = None
+
         self.ema_params = None
         self.log_counter = 0
         self.log_batch_pred = 100
 
+    def _shift_t(self, t):
+        """Apply dimension-dependent time shift (adapted from RAE)."""
+        if self.time_dist_shift is None:
+            return t
+        s = 1.0 - t
+        s = self.time_dist_shift * s / (1.0 + (self.time_dist_shift - 1.0) * s)
+        return 1.0 - s
+
     def sample_t(self, n: int, device=None):  # lognormal distribution
         t = torch.randn(n, device=device) * self.P_std + self.P_mean
-        return torch.sigmoid(t)
+        t = torch.sigmoid(t)
+        return self._shift_t(t)
 
     def forward(self, x, z, mask, labels):
         B, N, D = x.shape
@@ -72,7 +93,7 @@ class Denoiser(nn.Module):
         xt = t * x + (1 - t) * e
         v = (x - xt) / (1 - t).clamp_min(t_eps)
 
-        pred = self.denoising_net(xt, z, t.flatten(), labels)
+        pred = self.denoising_net(xt, z, t.flatten())
 
         if self.pred_type == 'x':
             v_pred = (pred - xt) / (1 - t).clamp_min(t_eps)
@@ -84,8 +105,13 @@ class Denoiser(nn.Module):
             v_pred = (xt-pred)/(t).clamp_min(t_eps)
             x_pred = (xt-(1-t) * pred) / t.clamp_min(t_eps)
 
-        # l2 loss
-        loss = (v - v_pred) ** 2
+        # l2 loss with min-SNR-gamma weighting
+        if self.snr_gamma is not None:
+            snr = (t / (1 - t).clamp_min(t_eps)) ** 2
+            weight = (torch.clamp(snr, max=self.snr_gamma) / snr.clamp_min(1e-8))
+            loss = weight * (v - v_pred) ** 2
+        else:
+            loss = (v - v_pred) ** 2
 
         if mask is not None:
             mask = mask.view(-1, 1)
@@ -130,6 +156,7 @@ class Denoiser(nn.Module):
         device = z.device
         bsz = xt.size(0)
         timesteps = torch.linspace(self.t_eps_sample, 1.0 - self.t_eps_sample, self.steps+1, device=device)
+        timesteps = self._shift_t(timesteps)
         timesteps = timesteps.view(-1, 1, 1).expand(-1, bsz, 1)  
 
         if self.method == "euler":
@@ -150,7 +177,7 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def _forward_sample(self, xt, z, t, labels):
-        pred = self.denoising_net(xt, z, t.view(-1), labels)
+        pred = self.denoising_net(xt, z, t.view(-1))
         if self.pred_type == 'v':
             v_pred = pred
         elif self.pred_type == 'x':

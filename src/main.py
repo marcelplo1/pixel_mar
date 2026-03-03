@@ -14,7 +14,8 @@ from model.multi_step_flow.denoiser import Denoiser
 from model.multi_step_flow.denoising_model import DenoisingModel
 from utils import ddp
 from utils.configs_utils import parse_configs
-from utils.utils import center_crop_arr, save_plot, write_csv, ImageNetLMDB
+from utils.logging_utils import log_model_parameters
+from utils.utils import center_crop_arr, ImageNetLMDB
 from train_eval import calc_val_loss, evaluate, train_one_epoch
 from utils.wandb_utils import initialize_wandb
 
@@ -28,8 +29,9 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
-    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context"])
-    parser.add_argument("--mae_type", type=str, default="end_to_end", help="Type of the mae", choices=["end_to_end", "pretrained_econder"])
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context", "cross_attn"])
+    parser.add_argument("--mae_type", type=str, default="end_to_end", help="Type of the mae", choices=["end_to_end", "pretrained_encoder"])
+    parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
@@ -103,7 +105,7 @@ def main():
 
     transform = transforms.Compose([
         transforms.Lambda(lambda img: center_crop_arr(img, args.img_size)),
-        #transforms.RandomHorizontalFlip(),
+        transforms.RandomHorizontalFlip(),
         transforms.ToTensor(),
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
@@ -137,7 +139,7 @@ def main():
         val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False
     )
 
-    num_workers = 4
+    num_workers = 8
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler_train,
                             num_workers=num_workers, pin_memory=True, persistent_workers=True)
 
@@ -147,8 +149,8 @@ def main():
     
     # Load MAE from config file
     if args.mae_type == 'end_to_end':
-        from model.mae import MAE
-    elif args.mae_type == 'pretrained_econder':
+        from model.mae_ import MAE
+    elif args.mae_type == 'pretrained_encoder':
         from model.mae_pretrained_encoder import MAE
 
     mae = MAE(
@@ -181,7 +183,8 @@ def main():
         dropout=denoiser_params.get('dropout', 0.1),
         z_hidden_dim=mae_params.get('decoder_dim', 768),
         num_classes=args.class_num,
-        denoiser_type=args.denoiser_type
+        denoiser_type=args.denoiser_type,
+        bottleneck_dim=denoiser_params.get('bottleneck_dim', None)
     )
     #Load denoiser from config file
     denoiser = Denoiser(
@@ -194,16 +197,16 @@ def main():
         sample_t_mean=model_params.get('sample_t_mean', 0.0),
         sample_t_std=model_params.get('sample_t_std', 1.0),
         t_eps=model_params.get('t_eps', 1e-2),
-        t_eps_sample=model_params.get('t_eps_sample', 1e-5),
+        t_eps_sample=sampler_config.get('t_eps_sample', 1e-2),
         noise_scale=sampler_config.get('noise_scale', 1.0),
         ema_decay=model_params.get('ema_decay', 0.9999),
-        use_logging=args.use_logging
+        use_logging=args.use_logging,
+        time_shift_base=model_params.get('time_shift_base', None)
     ).to(device)
 
-    n_mae_params = sum(p.numel() for p in mae.parameters() if p.requires_grad)
-    n_denoiser_params = sum(p.numel() for p in denoiser.parameters() if p.requires_grad)
-    n_params = n_mae_params + n_denoiser_params
-    print("Number of trainable parameters: {:.6f}M".format(n_params / 1e6))
+    if global_rank == 0 and args.log_parameters:
+        log_model_parameters(mae, denoiser, device, args)
+        torch.cuda.empty_cache()
 
     mae = torch.nn.parallel.DistributedDataParallel(mae, device_ids=[args.gpu], find_unused_parameters=False)
     denoiser = torch.nn.parallel.DistributedDataParallel(denoiser, device_ids=[args.gpu], find_unused_parameters=False)
@@ -228,10 +231,6 @@ def main():
         denoiser_single.ema_params = [p.to(device) for p in checkpoint['ema_denoiser']]
 
         args.start_epoch = checkpoint.get('epoch', 0)
-
-        if 'model_config' in checkpoint and model_config != checkpoint['model_config']:
-            print("Model config loaded from checkpoint is different")
-            return
 
         print("Loaded epoch: {}".format(checkpoint.get('epoch', None)))
         print("Total training steps: {}".format(checkpoint.get('step', None)))
@@ -290,13 +289,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
-
-
-
-
-
-
-
-
-
