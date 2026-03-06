@@ -162,6 +162,13 @@ class DenoisingModel(nn.Module):
             ])
             self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
             self.initialize__attn_weights()
+        elif denoiser_type == 'add':
+            self.blocks = nn.ModuleList([
+                AttenBlock(hidden_dim, hidden_dim // 64)
+                for i in range(depth)
+            ])
+            self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
+            self.initialize__attn_weights()
         
     def initialize__attn_weights(self):
         # Initialize transformer layers:
@@ -325,6 +332,28 @@ class DenoisingModel(nn.Module):
         x = self.final_layer(x, c)
         return x
 
+    def forward_add(self, x, z, t):
+        """
+        x: (B*N, D)
+        z: (B*N, D')
+        t: (B*N, 1)
+        """
+        x = self.x_proj(x)
+        t = self.t_embedder(t)
+        z = self.z_proj(z)
+
+        c = t  # adaLN condition is timestep only
+        x = x.unsqueeze(1)
+        z = z.unsqueeze(1)
+
+        for block in self.blocks:
+            x = block(x + z, c)
+
+        x = x[:, 0, :]
+        x = self.final_layer(x, c)
+
+        return x
+
     def forward(self, x, z, t):
         if self.denoiser_type == 'ada_ln':
             x = self.forward_ada_ln(x, z, t)
@@ -332,6 +361,8 @@ class DenoisingModel(nn.Module):
             x = self.forward_in_context(x, z, t)
         elif self.denoiser_type == 'attn':
             x = self.forward_attn(x, z, t)
+        elif self.denoiser_type == 'add':
+            x = self.forward_add(x, z, t)
         else:
             raise NotImplementedError
         return x
