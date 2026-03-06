@@ -10,8 +10,9 @@ model:
     sample_t_mean: 0.0
     sample_t_std: 1.0
     time_shift_base: 4096
-    diffusion_batch_mul: 4
+    diffusion_batch_mul: 1
     pred_type: 'x'  
+    bottleneck_dim: 128
   mae_params:
     mae_config: facebook/vit-mae-base
     encoder_dim: 768
@@ -26,11 +27,12 @@ model:
     mask_ratio_min: 0.7
   denoiser_params:
     hidden_dim: 768
-    depth: 3
+    depth: 12
     dropout: 0.1
 
 sampler:
   method: 'euler'
+  num_generation_passes: 1
   t_eps_sample: 1.0e-4
   num_ar_steps: 64
   num_timesteps: 100

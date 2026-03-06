@@ -87,7 +87,7 @@ class Denoiser(nn.Module):
         else:
             t_eps = self.t_eps_sample
 
-        t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
+        t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1))) # During inference same timelevel -> noiselevel
         e = torch.randn_like(x) * self.noise_scale
 
         xt = t * x + (1 - t) * e
@@ -114,8 +114,9 @@ class Denoiser(nn.Module):
             loss = (v - v_pred) ** 2
 
         if mask is not None:
-            mask = mask.view(-1, 1)
-            loss = (loss * mask).sum() / (mask.sum() * D)
+            loss = loss.view(-1, N, D)
+            mask = mask.view(-1, N, 1)
+            loss = ((loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) * D)).mean()
 
         self.log_counter += 1
         if self.use_logging and dist.get_rank() == 0 and self.log_counter % self.log_batch_pred == 0:

@@ -29,8 +29,8 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
-    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context", "cross_attn"])
-    parser.add_argument("--mae_type", type=str, default="end_to_end", help="Type of the mae", choices=["end_to_end", "pretrained_encoder"])
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context", "cross_attn", "attn"])
+    parser.add_argument("--mae_type", type=str, default="end_to_end", help="Type of the mae", choices=["end_to_end", "pretrained_encoder", "decoder_only"])
     parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
 
     # Training
@@ -152,6 +152,8 @@ def main():
         from model.mae_ import MAE
     elif args.mae_type == 'pretrained_encoder':
         from model.mae_pretrained_encoder import MAE
+    elif args.mae_type == 'decoder_only':
+        from model.decoder import MAE
 
     mae = MAE(
         img_size=args.img_size,
@@ -170,7 +172,8 @@ def main():
         min_mask_rate=mae_params.get('min_mask_rate', 0.7),
         num_classes=args.class_num,
         lable_dropout=args.label_drop_prob,
-        mae_config=mae_params.get('mae_config', None)
+        mae_config=mae_params.get('mae_config', None),
+        bottleneck_dim=model_params.get('bottleneck_dim', None)
     ).to(device)
 
     # Load denoising model from config file
@@ -184,7 +187,7 @@ def main():
         z_hidden_dim=mae_params.get('decoder_dim', 768),
         num_classes=args.class_num,
         denoiser_type=args.denoiser_type,
-        bottleneck_dim=denoiser_params.get('bottleneck_dim', None)
+        bottleneck_dim=model_params.get('bottleneck_dim', None)
     )
     #Load denoiser from config file
     denoiser = Denoiser(
@@ -284,7 +287,9 @@ def main():
                     "seed": args.seed, 
                     "args": vars(args)
                 }
-                torch.save(checkpoint, ckpt_path)
+                tmp_path = ckpt_path + ".tmp"
+                torch.save(checkpoint, tmp_path)
+                os.replace(tmp_path, ckpt_path)
                 print("Saving online checkpoint finished")
 
 if __name__ == "__main__":
