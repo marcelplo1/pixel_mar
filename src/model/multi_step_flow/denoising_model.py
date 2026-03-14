@@ -6,36 +6,25 @@ from model.model_utils import Attention, CrossAttention, RMSNorm, SwiGLUFFN, Tim
 
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
-
+    
 class ResBlock(nn.Module):
-    """
-    A residual block with adaLN.
-    """
-    def __init__(
-        self,
-        channels
-    ):
+    def __init__(self, hidden_dim, mlp_ratio=4.0, proj_drop=0.0):
         super().__init__()
-        self.channels = channels
-
-        self.in_ln = nn.LayerNorm(channels, eps=1e-6)
-        self.mlp = nn.Sequential(
-            nn.Linear(channels, channels, bias=True),
-            nn.SiLU(),
-            nn.Linear(channels, channels, bias=True),
-        )
-
+        self.norm = RMSNorm(hidden_dim, eps=1e-6)
+        mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        self.mlp = SwiGLUFFN(hidden_dim, mlp_hidden_dim, drop=proj_drop)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(channels, 3 * channels, bias=True)
+            nn.Linear(hidden_dim, 3 * hidden_dim, bias=True)
         )
 
-    def forward(self, x, y):
-        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(y).chunk(3, dim=-1)
-        h = modulate(self.in_ln(x), shift_mlp, scale_mlp)
-        h = self.mlp(h)
-        return x + gate_mlp * h
-    
+    @torch.compile
+    def forward(self, x,  c):
+        shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(3, dim=-1)
+        x = x + gate_mlp * self.mlp(modulate(self.norm(x), shift_mlp, scale_mlp))
+        return x
+
+
 class FinalLayer(nn.Module):
     """
     The final layer.
@@ -57,7 +46,7 @@ class FinalLayer(nn.Module):
         return x
     
 class AttenBlock(nn.Module):
-    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.1, proj_drop=0.1):
+    def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
         self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
@@ -126,16 +115,12 @@ class DenoisingModel(nn.Module):
         self.num_heads = hidden_dim // 64
         self.img_size = img_size
         self.denoiser_type = denoiser_type
-        self.bottleneck_dim = bottleneck_dim
 
         self.embedding_dim = channels * patch_size**2
         self.num_patches = (img_size // patch_size) ** 2
 
         if bottleneck_dim is not None:
-            self.x_proj = nn.Sequential(
-                nn.Linear(self.embedding_dim, bottleneck_dim, bias=False),
-                nn.Linear(bottleneck_dim, hidden_dim, bias=True),
-            )
+            self.x_proj = None
         else:
             self.x_proj = nn.Linear(self.embedding_dim, hidden_dim)
         self.t_embedder = TimestepEmbedder(hidden_dim)
@@ -143,7 +128,7 @@ class DenoisingModel(nn.Module):
 
         if denoiser_type == 'ada_ln':
             self.blocks = nn.ModuleList([
-                ResBlock(hidden_dim, depth_index=i, total_depth=depth)
+                ResBlock(hidden_dim)
                 for i in range(depth)
             ])
             self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
@@ -180,11 +165,7 @@ class DenoisingModel(nn.Module):
         self.apply(_basic_init)
 
         # Specific normal initialization for projections and embedders
-        if self.bottleneck_dim is not None:
-            nn.init.xavier_uniform_(self.x_proj[0].weight)
-            nn.init.xavier_uniform_(self.x_proj[1].weight)
-            nn.init.constant_(self.x_proj[1].bias, 0)
-        else:
+        if self.x_proj is not None:
             nn.init.normal_(self.x_proj.weight, std=0.02)
         nn.init.normal_(self.z_proj.weight, std=0.02)
 
@@ -214,11 +195,7 @@ class DenoisingModel(nn.Module):
         self.apply(_basic_init)
 
         # Specific normal initialization for projections and embedders
-        if self.bottleneck_dim is not None:
-            nn.init.xavier_uniform_(self.x_proj[0].weight)
-            nn.init.xavier_uniform_(self.x_proj[1].weight)
-            nn.init.constant_(self.x_proj[1].bias, 0)
-        else:
+        if self.x_proj is not None:
             nn.init.normal_(self.x_proj.weight, std=0.02)
         nn.init.normal_(self.z_proj.weight, std=0.02)
 
@@ -241,6 +218,7 @@ class DenoisingModel(nn.Module):
         nn.init.constant_(self.final_layer.bias, 0)
 
     def initialize_weights_ada_ln(self):
+        # Initialize transformer layers:
         def _basic_init(module):
             if isinstance(module, nn.Linear):
                 torch.nn.init.xavier_uniform_(module.weight)
@@ -248,23 +226,34 @@ class DenoisingModel(nn.Module):
                     nn.init.constant_(module.bias, 0)
         self.apply(_basic_init)
 
+        # Specific normal initialization for projections and embedders
+        if self.x_proj is not None:
+            nn.init.normal_(self.x_proj.weight, std=0.02)
+        nn.init.normal_(self.z_proj.weight, std=0.02)
+
+        # Timestep MLP initialization (standard in diffusion models)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
+        # Zero-out adaLN modulation layers:
         for block in self.blocks:
-            # Zero adaLN modulation weights, then set non-zero gate bias
             nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-            
-            # MLP (w3) keeps Xavier init — gate at 1/depth controls magnitude.
-            block.initialize_gate_bias()
 
-            # Zero x0_proj so input injection starts inactive
-            nn.init.constant_(block.x0_proj.weight, 0)
-            nn.init.constant_(block.x0_proj.bias, 0)
+        # Zero-out output layers:
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
 
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+    def _proj_x(self, x):
+        """Project input patches through shared bottleneck or linear embedding."""
+        shared = getattr(self, 'shared_x_proj', None)
+        if shared is not None:
+            x = x.view(-1, self.in_channels, self.patch_size, self.patch_size)
+            return shared.proj2(shared.proj1(x)).flatten(1)
+        return self.x_proj(x)
 
     def forward_in_context(self, x, z, t):
         """
@@ -273,8 +262,8 @@ class DenoisingModel(nn.Module):
         y: (B*N, Cls_num)
         t: (B*N, 1)
         """
-        x = self.x_proj(x)  
-        t = self.t_embedder(t)      
+        x = self._proj_x(x)
+        t = self.t_embedder(t)
         z = self.z_proj(z)
 
         c = t + z
@@ -298,8 +287,8 @@ class DenoisingModel(nn.Module):
         y: (B*N, Cls_num)
         t: (B*N, 1)
         """
-        x = self.x_proj(x)  
-        t = self.t_embedder(t)      
+        x = self._proj_x(x)
+        t = self.t_embedder(t)
         z = self.z_proj(z)
 
         c = t + z
@@ -320,8 +309,7 @@ class DenoisingModel(nn.Module):
         z: (B*N, D')
         t: (B*N, 1)
         """
-
-        x = self.x_proj(x)
+        x = self._proj_x(x)
         t = self.t_embedder(t)
         z = self.z_proj(z)
         c = t + z
@@ -338,7 +326,7 @@ class DenoisingModel(nn.Module):
         z: (B*N, D')
         t: (B*N, 1)
         """
-        x = self.x_proj(x)
+        x = self._proj_x(x)
         t = self.t_embedder(t)
         z = self.z_proj(z)
 

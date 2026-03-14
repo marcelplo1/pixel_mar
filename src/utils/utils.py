@@ -136,6 +136,27 @@ def write_csv(name, path, list):
         for item in list:
             writer.writerow([item])
 
+class SingleImageDataset(Dataset):
+    """Dataset that returns the same image repeatedly, for overfitting tests."""
+    def __init__(self, image_path, img_size, label=0, length=64):
+        from torchvision import transforms
+        self.length = length
+        self.label = label
+        transform = transforms.Compose([
+            transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
+        ])
+        img = Image.open(image_path).convert('RGB')
+        self.image = transform(img)
+
+    def __len__(self):
+        return self.length
+
+    def __getitem__(self, idx):
+        return self.image, self.label
+
+
 class ImageNetLMDB(Dataset):
     def __init__(self, db_path, transform=None):
         self.db_path = db_path

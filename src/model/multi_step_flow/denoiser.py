@@ -23,7 +23,10 @@ class Denoiser(nn.Module):
         noise_scale = 1.0,
         ema_decay = 0.9999,
         use_logging=False,
-        time_shift_base=None
+        use_latent_space=False,
+        time_shift=None,
+        atol=1e-5,
+        rtol=1e-5
     ):
         super().__init__()
 
@@ -43,37 +46,33 @@ class Denoiser(nn.Module):
 
         self.use_logging = use_logging
         self.output_dir = output_dir
+        self.use_latent_space = use_latent_space
 
         self.pred_type = pred_type
-        self.ema_decay = ema_decay
+        self.ema_decays = ema_decay if isinstance(ema_decay, list) else [ema_decay]
         self.diffusion_batch_mul = diffusion_batch_mul
 
-        # Dimension-dependent time shift
-        if time_shift_base is not None:
-            shift_dim = self.channels * self.patch_size ** 2
-            self.time_dist_shift = math.sqrt(shift_dim / time_shift_base)
-        else:
-            self.time_dist_shift = None
-
-        #self.snr_gamma = 5.0
-        self.snr_gamma = None
-
-        self.ema_params = None
+        self.time_shift = time_shift
+        self.atol = atol
+        self.rtol = rtol
+        self.ema_params_list = None
         self.log_counter = 0
         self.log_batch_pred = 100
 
     def _shift_t(self, t):
-        """Apply dimension-dependent time shift (adapted from RAE)."""
-        if self.time_dist_shift is None:
-            return t
+        """Apply time shift."""
         s = 1.0 - t
-        s = self.time_dist_shift * s / (1.0 + (self.time_dist_shift - 1.0) * s)
+        s = self.time_shift * s / (1.0 + (self.time_shift - 1.0) * s)
         return 1.0 - s
 
     def sample_t(self, n: int, device=None):  # lognormal distribution
+        """Log normal time sampling"""
         t = torch.randn(n, device=device) * self.P_std + self.P_mean
         t = torch.sigmoid(t)
-        return self._shift_t(t)
+        if self.time_shift is not None:
+            return self._shift_t(t)
+        else:
+            return t
 
     def forward(self, x, z, mask, labels):
         B, N, D = x.shape
@@ -87,7 +86,7 @@ class Denoiser(nn.Module):
         else:
             t_eps = self.t_eps_sample
 
-        t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1))) # During inference same timelevel -> noiselevel
+        t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
 
         xt = t * x + (1 - t) * e
@@ -105,13 +104,7 @@ class Denoiser(nn.Module):
             v_pred = (xt-pred)/(t).clamp_min(t_eps)
             x_pred = (xt-(1-t) * pred) / t.clamp_min(t_eps)
 
-        # l2 loss with min-SNR-gamma weighting
-        if self.snr_gamma is not None:
-            snr = (t / (1 - t).clamp_min(t_eps)) ** 2
-            weight = (torch.clamp(snr, max=self.snr_gamma) / snr.clamp_min(1e-8))
-            loss = weight * (v - v_pred) ** 2
-        else:
-            loss = (v - v_pred) ** 2
+        loss = (v - v_pred) ** 2
 
         if mask is not None:
             loss = loss.view(-1, N, D)
@@ -123,42 +116,41 @@ class Denoiser(nn.Module):
             self.log_counter = 0
             time_step = round(t[0].item(), 1)
 
-            x_vis = x.view(self.diffusion_batch_mul, B, N, D)[0]
-            x_pred_vis = x_pred.view(self.diffusion_batch_mul, B, N, D)[0].clamp(-1, 1)
-            v_pred_vis = v_pred.view(self.diffusion_batch_mul, B, N, D)[0]
-            mask_vis = mask.view(self.diffusion_batch_mul, B, N, 1)[0]
-            
-            error_vis = torch.abs(x_vis - x_pred_vis)
+            # Skip pixel-space visualization when operating in latent space
+            if self.use_latent_space == False:
+                x_vis = x.view(self.diffusion_batch_mul, B, N, D)[0]
+                x_pred_vis = x_pred.view(self.diffusion_batch_mul, B, N, D)[0].clamp(-1, 1)
+                v_pred_vis = v_pred.view(self.diffusion_batch_mul, B, N, D)[0]
+                mask_vis = mask.view(self.diffusion_batch_mul, B, N, 1)[0]
 
-            x_pred_vis[(mask_vis==0).expand_as(x_pred_vis)] = -1.0
+                x_pred_vis[(mask_vis==0).expand_as(x_pred_vis)] = -1.0
 
+                folder = os.path.join(self.output_dir, "last_training_predictions")
+                os.makedirs(folder, exist_ok=True)
 
-            folder = os.path.join(self.output_dir, "last_training_predictions")
-            os.makedirs(folder, exist_ok=True)
+                x_path =  os.path.join(folder, "ground_truth_t={}.png".format(time_step))
+                save_img_as_fig(unpatchify(x_vis, self.patch_size, self.channels),
+                                file_path=x_path, size=self.img_size)
 
-            x_path =  os.path.join(folder, "ground_truth_t={}.png".format(time_step))
-            save_img_as_fig(unpatchify(x_vis, self.patch_size, self.channels), 
-                            file_path=x_path, size=self.img_size)
-            
-            x_pred_path = os.path.join(folder, "prediction_t={}.png".format(time_step))
-            save_img_as_fig(unpatchify(x_pred_vis, self.patch_size, self.channels), 
-                            file_path=x_pred_path.format(time_step), size=self.img_size)
-
-            # save_img_as_fig(unpatchify(v_pred_vis, self.denoising_net.patch_size, N, self.channels), 
-            #                 filename="velocity_field_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
-
-            # save_img_as_fig(unpatchify(error_vis, self.denoising_net.patch_size, N, self.channels), 
-            #                 filename="error_map_t={}.png".format(time_step), path=self.output_dir, size=self.img_size)
+                x_pred_path = os.path.join(folder, "prediction_t={}.png".format(time_step))
+                save_img_as_fig(unpatchify(x_pred_vis, self.patch_size, self.channels),
+                                file_path=x_pred_path.format(time_step), size=self.img_size)
 
         return loss
 
     @torch.no_grad()
-    def generate(self, xt, z, labels):
+    def generate(self, xt, z, labels, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
         device = z.device
         bsz = xt.size(0)
         timesteps = torch.linspace(self.t_eps_sample, 1.0 - self.t_eps_sample, self.steps+1, device=device)
-        timesteps = self._shift_t(timesteps)
-        timesteps = timesteps.view(-1, 1, 1).expand(-1, bsz, 1)  
+        if self.time_shift is not None:
+            timesteps = self._shift_t(timesteps)
+
+        # TODO: Remove the test method and itegrate it with fixed ODEs
+        if self.method == 'dopri5':
+            return self._generate_adaptive(xt, z, timesteps, z_uncond, cfg_scale, cfg_interval)
+
+        timesteps = timesteps.view(-1, 1, 1).expand(-1, bsz, 1)
 
         if self.method == "euler":
             stepper = self._euler_step
@@ -171,34 +163,69 @@ class Denoiser(nn.Module):
         for i in range(self.steps-1):
             t = timesteps[i]
             t_next = timesteps[i + 1]
-            xt = stepper(xt, z, t, t_next, labels)
-            # TODO Log each noisy step
-        xt = self._euler_step(xt, z, timesteps[-2], timesteps[-1], labels)
+            xt = stepper(xt, z, t, t_next, z_uncond, cfg_scale, cfg_interval)
+        xt = self._euler_step(xt, z, timesteps[-2], timesteps[-1], z_uncond, cfg_scale, cfg_interval)
         return xt
 
     @torch.no_grad()
-    def _forward_sample(self, xt, z, t, labels):
-        pred = self.denoising_net(xt, z, t.view(-1))
+    def _generate_adaptive(self, xt, z, t_span, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        from torchdiffeq import odeint
+
+        def drift_fn(t, x):
+            t_batch = t.expand(x.size(0)).unsqueeze(-1)
+            return self._forward_sample(x, z, t_batch, z_uncond, cfg_scale, cfg_interval)
+
+        trajectory = odeint(
+            drift_fn,
+            xt,
+            t_span,
+            method=self.method,
+            atol=self.atol,
+            rtol=self.rtol,
+        )
+
+        return trajectory[-1]
+
+    def _pred_to_velocity(self, pred, xt, t):
         if self.pred_type == 'v':
-            v_pred = pred
+            return pred
         elif self.pred_type == 'x':
-            v_pred = (pred - xt) / (1.0 - t).clamp_min(self.t_eps)
+            return (pred - xt) / (1.0 - t).clamp_min(self.t_eps)
         elif self.pred_type == 'e':
-            v_pred = (xt - pred) / (t).clamp_min(self.t_eps)
-        return v_pred
+            return (xt - pred) / (t).clamp_min(self.t_eps)
 
     @torch.no_grad()
-    def _euler_step(self, xt, z, t, t_next, labels):
-        v_pred = self._forward_sample(xt, z, t, labels)
+    def _forward_sample(self, xt, z, t, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        # Conditional prediction
+        pred_cond = self.denoising_net(xt, z, t.view(-1))
+        v_cond = self._pred_to_velocity(pred_cond, xt, t)
+
+        if cfg_scale == 1.0 or z_uncond is None:
+            return v_cond
+
+        # Unconditional prediction
+        pred_uncond = self.denoising_net(xt, z_uncond, t.view(-1))
+        v_uncond = self._pred_to_velocity(pred_uncond, xt, t)
+
+        # CFG interval masking
+        low, high = cfg_interval
+        interval_mask = (t < high) & ((low == 0) | (t > low))
+        scale = torch.where(interval_mask, cfg_scale, 1.0)
+
+        return v_uncond + scale * (v_cond - v_uncond)
+
+    @torch.no_grad()
+    def _euler_step(self, xt, z, t, t_next, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        v_pred = self._forward_sample(xt, z, t, z_uncond, cfg_scale, cfg_interval)
         xt_next = xt + (t_next - t) * v_pred
         return xt_next
 
     @torch.no_grad()
-    def _heun_step(self, xt, z, t, t_next, labels):
-        v_pred_t = self._forward_sample(xt, z, t, labels)
+    def _heun_step(self, xt, z, t, t_next, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        v_pred_t = self._forward_sample(xt, z, t, z_uncond, cfg_scale, cfg_interval)
 
         xt_next_euler = xt + (t_next - t) * v_pred_t
-        v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next, labels)
+        v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next, z_uncond, cfg_scale, cfg_interval)
 
         v_pred = 0.5 * (v_pred_t + v_pred_t_next)
         xt_next = xt + (t_next - t) * v_pred
@@ -206,7 +233,7 @@ class Denoiser(nn.Module):
 
     @torch.no_grad()
     def update_ema(self):
-        ema_decay = self.ema_decay
         source_params = list(self.parameters())
-        for targ, src in zip(self.ema_params, source_params):
-            targ.detach().mul_(ema_decay).add_(src, alpha=1 - ema_decay)
+        for ema_params, decay in zip(self.ema_params_list, self.ema_decays):
+            for targ, src in zip(ema_params, source_params):
+                targ.detach().mul_(decay).add_(src, alpha=1 - decay)

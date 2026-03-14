@@ -7,15 +7,15 @@ import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, ConcatDataset, DistributedSampler
 from torchvision import datasets, transforms
-import torch.distributed as dist
 import copy
 
 from model.multi_step_flow.denoiser import Denoiser
 from model.multi_step_flow.denoising_model import DenoisingModel
+from model.ar_decoder import ArDecoder
 from utils import ddp
 from utils.configs_utils import parse_configs
 from utils.logging_utils import log_model_parameters
-from utils.utils import center_crop_arr, ImageNetLMDB
+from utils.utils import center_crop_arr, ImageNetLMDB, SingleImageDataset
 from train_eval import calc_val_loss, evaluate, train_one_epoch
 from utils.wandb_utils import initialize_wandb
 
@@ -30,8 +30,8 @@ def create_parser():
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
     parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context", "cross_attn", "attn", "add"])
-    parser.add_argument("--mae_type", type=str, default="end_to_end", help="Type of the mae", choices=["end_to_end", "pretrained_encoder", "decoder_only"])
     parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
+    parser.add_argument("--use_latent_space", action="store_true", help="Operate denoiser in DINOv2 latent space instead of pixel space")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
@@ -41,15 +41,21 @@ def create_parser():
     parser.add_argument('--weight_decay', default=0.02, type=float, help='Weight decay for the optimizer')
     parser.add_argument("--save_freq", type=int, default=5, help="Frequency of saving the checkpoint")
     parser.add_argument("--label_drop_prob", type=float, default=0.1, help="Learning rate")
+    parser.add_argument("--overfit_single_image", action="store_true", help="Train on a single image to validate the pipeline")
 
-    # Sampling 
+    # Auxiliary losses
+    parser.add_argument("--recon_weight", type=float, default=0, help="Weight for MAR reconstruction loss (0 = disabled)")
+
+    # Sampling
     parser.add_argument("--gen_batch_size", type=int, default=16, help="Batch size for sampling")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate the model after training")
     parser.add_argument("--num_images", type=int, default=50000, help="Number of images to generate during evaluation")
     parser.add_argument("--online_eval_freq", type=int, default=25, help="Frequency of online evaluation during training")
     parser.add_argument("--remove_ema", action="store_true", help="Use exponential moving average for the model parameters")
     parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-free guidance scale (1.0 = no guidance)")
-    parser.add_argument("--cfg_schedule", type=str, default="linear", choices=["linear", "constant"], help="CFG schedule over AR steps")
+    parser.add_argument("--cfg_interval_min", type=float, default=0.1, help="CFG interval lower bound (denoiser timestep)")
+    parser.add_argument("--cfg_interval_max", type=float, default=1.0, help="CFG interval upper bound (denoiser timestep)")
+    parser.add_argument("--ema_eval_decay", type=float, default=None, help="EMA decay value to use for evaluation (must match one of ema_decays in config)")
 
     # Dataset
     parser.add_argument("--class_num", type=int, default=1000, help="Number of classes in the dataset")
@@ -85,8 +91,9 @@ def main():
 
     model_config, sampler_config = parse_configs(args.config)
     model_params = model_config.get('params', None)
-    mae_params = model_config.get('mae_params', None)
+    ar_params = model_config.get('ar_params', None)
     denoiser_params = model_config.get('denoiser_params', None)
+    rae_params = model_config.get('rae_params', None)
 
     model_name = model_config.get('name', 'None')
     dataset_name = model_config.get('dataset_name', 'ImageNet')
@@ -118,18 +125,30 @@ def main():
         val_dataset = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform)
 
     if args.has_fixed_target_class:
-        targets = torch.tensor(dataset.targets)
-        indices = (targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
-        dataset = Subset(dataset, indices)
+        if hasattr(dataset, 'targets'):
+            targets = torch.tensor(dataset.targets)
+            indices = (targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
+            dataset = Subset(dataset, indices)
 
-        val_targets = torch.tensor(val_dataset.targets)
-        val_indices = (val_targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
-        val_dataset = Subset(val_dataset, val_indices)
+            val_targets = torch.tensor(val_dataset.targets)
+            val_indices = (val_targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
+            val_dataset = Subset(val_dataset, val_indices)
+        else:
+            print(f"Warning: dataset type '{args.dataset_type}' does not support fixed target class filtering, skipping.")
 
         if len(dataset) == 0:
             print("Fixed dataset class not found!")
             return
         print(f"Filtered dataset to class {args.fixed_target_class}. New size: {len(dataset)}")
+
+    if args.overfit_single_image:
+        img_path = "data/single_image.JPEG"
+        dataset = SingleImageDataset(img_path, args.img_size, length=max(args.batch_size * world_size * 8, 512))
+        val_dataset = SingleImageDataset(img_path, args.img_size, length=max(args.batch_size * world_size, 64))
+        args.has_fixed_target_class = True
+        args.fixed_target_class = 0
+        args.label_drop_prob = 0.0
+        print(f"Overfitting on single image: {img_path}")
 
     sampler_train = DistributedSampler(
         dataset, num_replicas=world_size, rank=global_rank, shuffle=True
@@ -147,33 +166,43 @@ def main():
                             num_workers=num_workers, pin_memory=True, persistent_workers=True
     )
     
-    # Load MAE from config file
-    if args.mae_type == 'end_to_end':
-        from model.mae_ import MAE
-    elif args.mae_type == 'pretrained_encoder':
-        from model.mae_pretrained_encoder import MAE
-    elif args.mae_type == 'decoder_only':
-        from model.decoder import MAE
+    # RAE tokenizer for latent space mode
+    rae_tokenizer = None
+    latent_dim = None
+    if args.use_latent_space:
+        from rae.rae_tokenizer import RaeTokenizer
+        rae_tokenizer = RaeTokenizer(
+            dinov2_path=rae_params.get('rae_encoder', 'facebook/dinov2-with-registers-base'),
+            rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
+            rae_decoder_ckp=rae_params.get('rae_decoder_ckp', None),
+            rae_norm_stats=rae_params.get('rae_norm_stats', None),
+            encoder_input_size=rae_params.get('encoder_input_size', 224),
+            decoder_patch_size=args.patch_size,
+        ).to(device)
+        rae_tokenizer.eval()
+        latent_dim = rae_tokenizer.latent_dim
+        print(f"Latent space mode: RAE dim={latent_dim}, patches={rae_tokenizer.num_patches}")
 
-    mae = MAE(
+    ema_decay = model_params.get('ema_decay', [0.9999])
+    if not isinstance(ema_decay, list):
+        ema_decay = [ema_decay]
+
+    ar_model = ArDecoder(
         img_size=args.img_size,
         patch_size=args.patch_size,
         channels=args.channels,
-        ema_decay=model_params.get('ema_decay', 0.9999),
-        encoder_dim=mae_params.get('encoder_dim', 768),
-        decoder_dim=mae_params.get('decoder_dim', 768),
-        encoder_depth=mae_params.get('encoder_depth', 12),
-        decoder_depth=mae_params.get('decoder_depth', 12),
-        encoder_num_heads=mae_params.get('encoder_num_heads', 12),
-        decoder_num_heads=mae_params.get('decoder_num_heads', 12),
-        mlp_ratio=mae_params.get('mlp_ratio', 4.0),
-        dropout=mae_params.get('dropout', 0.1),
-        buffer_size=mae_params.get('buffer_size', 64),
-        min_mask_rate=mae_params.get('min_mask_rate', 0.7),
+        ema_decay=ema_decay,
+        decoder_dim=ar_params.get('decoder_dim', 768),
+        decoder_depth=ar_params.get('decoder_depth', 12),
+        decoder_num_heads=ar_params.get('decoder_num_heads', 12),
+        mlp_ratio=ar_params.get('mlp_ratio', 4.0),
+        dropout=ar_params.get('dropout', 0.1),
+        buffer_size=ar_params.get('buffer_size', 64),
+        min_mask_rate=ar_params.get('mask_ratio_min', 0.7),
         num_classes=args.class_num,
         lable_dropout=args.label_drop_prob,
-        mae_config=mae_params.get('mae_config', None),
-        bottleneck_dim=model_params.get('bottleneck_dim', None)
+        bottleneck_dim=model_params.get('bottleneck_dim', None),
+        latent_dim=rae_params.get('latent_dim', None) if rae_params else None
     ).to(device)
 
     # Load denoising model from config file
@@ -184,7 +213,7 @@ def main():
         hidden_dim=denoiser_params.get('hidden_dim', 1024),
         depth=denoiser_params.get('depth', 6),
         dropout=denoiser_params.get('dropout', 0.1),
-        z_hidden_dim=mae_params.get('decoder_dim', 768),
+        z_hidden_dim=ar_params.get('decoder_dim', 768),
         num_classes=args.class_num,
         denoiser_type=args.denoiser_type,
         bottleneck_dim=model_params.get('bottleneck_dim', None)
@@ -195,31 +224,43 @@ def main():
         output_dir=args.output_dir,
         sampling_method=sampler_config.get('method', 'euler'),
         pred_type=model_params.get('pred_type', 'v'),
-        diffusion_batch_mul=model_params.get('diffusion_batch_mul', 4),
+        diffusion_batch_mul=model_params.get('diffusion_batch_mul', 1),
         num_timesteps=sampler_config.get('num_timesteps', 100),
         sample_t_mean=model_params.get('sample_t_mean', 0.0),
         sample_t_std=model_params.get('sample_t_std', 1.0),
         t_eps=model_params.get('t_eps', 1e-2),
         t_eps_sample=sampler_config.get('t_eps_sample', 1e-2),
         noise_scale=sampler_config.get('noise_scale', 1.0),
-        ema_decay=model_params.get('ema_decay', 0.9999),
+        ema_decay=ema_decay,
         use_logging=args.use_logging,
-        time_shift_base=model_params.get('time_shift_base', None)
+        time_shift=model_params.get('time_shift', None),
+        atol=sampler_config.get('atol', 1e-5),
+        rtol=sampler_config.get('rtol', 1e-5),
     ).to(device)
 
+    # Share bottleneck embedding between AR-model and denoiser (just used in pixelspace)
+    bottleneck_dim = model_params.get('bottleneck_dim', None)
+    if bottleneck_dim is not None:
+        object.__setattr__(denoising_model, 'shared_x_proj', ar_model.x_proj)
+
+    if args.use_latent_space:
+        denoiser_single = denoiser if not hasattr(denoiser, 'module') else denoiser.module
+        denoiser_single.use_latent_space = True
+
     if global_rank == 0 and args.log_parameters:
-        log_model_parameters(mae, denoiser, device, args)
+        log_model_parameters(ar_model, denoiser, device, args)
         torch.cuda.empty_cache()
 
-    mae = torch.nn.parallel.DistributedDataParallel(mae, device_ids=[args.gpu], find_unused_parameters=False)
+    ar_model = torch.nn.parallel.DistributedDataParallel(ar_model, device_ids=[args.gpu], find_unused_parameters=True)
     denoiser = torch.nn.parallel.DistributedDataParallel(denoiser, device_ids=[args.gpu], find_unused_parameters=False)
-    mae_single = mae.module
+    ar_model_single = ar_model.module
     denoiser_single = denoiser.module
     
+    opt_params = list(ar_model.parameters()) + list(denoiser.parameters())
     optimizer = optim.AdamW(
-        list(mae.parameters()) + list(denoiser.parameters()), 
-        lr=args.lr, 
-        weight_decay=args.weight_decay, 
+        opt_params,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
         betas=(0.9, 0.95)
     )
 
@@ -227,11 +268,31 @@ def main():
         print("Loading from checkpoint...")
         checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
 
-        mae_single.load_state_dict(checkpoint['mae'])
+        if 'ar_model' in checkpoint:
+            ar_model_single.load_state_dict(checkpoint['ar_model'])
+            ema_ar_raw = checkpoint['ema_ar_model']
+        else:
+            ar_model_single.load_state_dict(checkpoint['mae'])
+            ema_ar_raw = checkpoint['ema_mae']
         denoiser_single.load_state_dict(checkpoint['denoiser'])
         optimizer.load_state_dict(checkpoint['optimizer'])
-        mae_single.ema_params = [p.to(device) for p in checkpoint['ema_mae']]
-        denoiser_single.ema_params = [p.to(device) for p in checkpoint['ema_denoiser']]
+        ema_den_raw = checkpoint['ema_denoiser']
+
+        # Backward compatibility #TODO Remove this in the future
+        def _load_ema(raw, num_emas, device):
+            if isinstance(raw[0], torch.Tensor):
+                # Old format: single EMA
+                single = [p.to(device) for p in raw]
+                return [copy.deepcopy(single) for _ in range(num_emas)]
+            else:
+                # New format: list of EMAs
+                loaded = [[p.to(device) for p in ema] for ema in raw]
+                while len(loaded) < num_emas:
+                    loaded.append(copy.deepcopy(loaded[-1]))
+                return loaded[:num_emas]
+
+        ar_model_single.ema_params_list = _load_ema(ema_ar_raw, len(ema_decay), device)
+        denoiser_single.ema_params_list = _load_ema(ema_den_raw, len(ema_decay), device)
 
         args.start_epoch = checkpoint.get('epoch', 0)
 
@@ -240,13 +301,13 @@ def main():
         print("Checkpoint args: {} \n".format(checkpoint.get('args', None)).replace(', ', ',\n'))
     else:
         print("{}".format(args).replace(', ', ',\n'))
-        mae_single.ema_params = copy.deepcopy(list(mae.parameters()))
-        denoiser_single.ema_params = copy.deepcopy(list(denoiser.parameters()))
+        ar_model_single.ema_params_list = [copy.deepcopy(list(ar_model.parameters())) for _ in ema_decay]
+        denoiser_single.ema_params_list = [copy.deepcopy(list(denoiser.parameters())) for _ in ema_decay]
 
     metrics = {k: [] for k in ['loss', 'fid', 'is', 'precision', 'recall']}
     if args.evaluate:
         print("Starting sampling...")
-        evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=None, metrics=metrics)
+        evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=None, metrics=metrics, rae_tokenizer=rae_tokenizer)
         return
 
     print("Starting training...")
@@ -254,15 +315,15 @@ def main():
         if args.distributed:
             dataloader.sampler.set_epoch(epoch)
 
-        global_step = train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, 
-                                       optimizer, device)
-        
-        calc_val_loss(args, mae_single, denoiser_single, dataloader_val, epoch, device)
+        global_step = train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single, denoiser_single,
+                                       optimizer, device, rae_tokenizer=rae_tokenizer)
+
+        calc_val_loss(args, ar_model_single, denoiser_single, dataloader_val, epoch, device, rae_tokenizer=rae_tokenizer)
 
         #if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0 or epoch == args.epochs:
         if int(epoch) % args.online_eval_freq == 0 or epoch == args.epochs:
             print("Starting online evaluation...")
-            evaluate(args=args, mae=mae_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics)
+            evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics, rae_tokenizer=rae_tokenizer)
             print("Online evaluation finsihed")
 
         if global_rank == 0:
@@ -272,11 +333,11 @@ def main():
                 ckpt_path = os.path.join(args.output_dir, "checkpoint_last.pt")
 
                 checkpoint = {
-                    "mae": mae_single.state_dict(),
+                    "ar_model": ar_model_single.state_dict(),
                     "denoiser": denoiser_single.state_dict(),
                     "optimizer": optimizer.state_dict(),
-                    "ema_mae": mae_single.ema_params,
-                    "ema_denoiser": denoiser_single.ema_params,
+                    "ema_ar_model": ar_model_single.ema_params_list,
+                    "ema_denoiser": denoiser_single.ema_params_list,
 
                     "epoch": epoch,
                     "step": global_step,
@@ -284,7 +345,7 @@ def main():
                     "config_path": args.config,
                     "model_config": model_config,
                     "sampler_config": sampler_config,
-                    "seed": args.seed, 
+                    "seed": args.seed,
                     "args": vars(args)
                 }
                 tmp_path = ckpt_path + ".tmp"

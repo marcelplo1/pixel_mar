@@ -11,7 +11,7 @@ def mask_by_order(mask_len, order, bsz, seq_len, device ):
     return masking
 
 @torch.no_grad()
-def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
+def sample(args, ar_model, denoiser, labels, device, model_params, sampler_params, rae_tokenizer=None):
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
@@ -23,69 +23,71 @@ def sample(args, mae, denoiser, labels, device, model_params, sampler_params):
     num_ar_steps = sampler_params.get('num_ar_steps', 64)
 
     cfg_scale = getattr(args, 'cfg_scale', 1.0)
-    cfg_schedule = getattr(args, 'cfg_schedule', 'linear')
+    cfg_interval = (getattr(args, 'cfg_interval_min', 0.0), getattr(args, 'cfg_interval_max', 1.0))
+    use_latent = getattr(args, 'use_latent_space', False) and rae_tokenizer is not None
 
     seq_len = (img_size// patch_size) ** 2
-    embed_dim = (patch_size ** 2) * channels
+
+    if use_latent:
+        embed_dim = rae_tokenizer.latent_dim
+    else:
+        embed_dim = (patch_size ** 2) * channels
 
     cur_tokens = torch.zeros(bsz, seq_len, embed_dim, device=device)
     orders = sample_order(bsz, seq_len, device)
-    
+
     num_generation_passes = sampler_params.get('num_generation_passes', 1)
+
+    # --- Pass 0: autoregressive generation ---
     xt_global = noise_scale * torch.randn(bsz, seq_len, embed_dim, device=device)
-    for pass_idx in range(num_generation_passes):
-        num_visible = 0
+    num_visible = 0
+    for i in range(num_ar_steps):
+        if use_latent:
+            ar_model_input = cur_tokens
+        else:
+            ar_model_input = unpatchify(cur_tokens, patch_size, channels=channels)
 
-        for i in range(num_ar_steps):
-            tokens = unpatchify(cur_tokens, patch_size, channels=channels)
+        if cfg_scale != 1.0:
+            z_cond, mask, _ = ar_model(ar_model_input, orders, labels, num_visible)
+            z_uncond, _, _ = ar_model(ar_model_input, orders, labels, num_visible, force_unconditional=True)
+        else:
+            z_cond, mask, _ = ar_model(ar_model_input, orders, labels, num_visible)
+            z_uncond = None
 
-            # In refinement passes, MAE sees the full image for better context
-            mae_num_visible = seq_len if pass_idx > 0 else num_visible
+        mask_ratio = np.cos(math.pi / 2. * (i + 1) / num_ar_steps)
+        mask_len = int(np.floor(seq_len * mask_ratio))
+        next_num_visible = seq_len - mask_len
 
-            if cfg_scale != 1.0:
-                # CFG: run MAE conditionally and unconditionally, combine z
-                z_cond, mask = mae(tokens, orders, labels, mae_num_visible)
-                z_uncond, _ = mae(tokens, orders, labels, mae_num_visible, force_unconditional=True)
+        if next_num_visible <= num_visible and i < num_ar_steps - 1:
+            next_num_visible = num_visible + 1
 
-                if cfg_schedule == "linear":
-                    cfg_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
-                else:  # constant
-                    cfg_iter = cfg_scale
+        ids_to_predict = orders[:, num_visible:next_num_visible]
+        mask_to_pred = torch.zeros(bsz, seq_len, device=device, dtype=torch.bool)
+        mask_to_pred.scatter_(1, ids_to_predict.long(), True)
+        num_visible = next_num_visible
 
-                z = z_uncond + cfg_iter * (z_cond - z_uncond)
+        pred_indices = mask_to_pred.nonzero(as_tuple=True)
+        z_c = z_cond[pred_indices]
+        z_u = z_uncond[pred_indices] if z_uncond is not None else None
+        xt_mask = xt_global[pred_indices]
+        y = labels.repeat(z_c.shape[0] // bsz)
+
+        sampled_x = denoiser.generate(xt_mask, z_c, y, z_uncond=z_u, cfg_scale=cfg_scale, cfg_interval=cfg_interval)
+        cur_tokens[pred_indices] = sampled_x
+
+        if args.use_logging and local_rank == 0:
+            folder = os.path.join(args.output_dir, "ar_generation_steps")
+            os.makedirs(folder, exist_ok=True)
+            file_path = os.path.join(folder, "pass0_step_{}.png".format(i))
+
+            if use_latent:
+                save_img_as_fig(rae_tokenizer.decode(cur_tokens), file_path=file_path, size=img_size)
             else:
-                z, mask = mae(tokens, orders, labels, mae_num_visible)
-
-            mask_ratio = np.cos(math.pi / 2. * (i + 1) / num_ar_steps)
-            mask_len = int(np.floor(seq_len * mask_ratio))
-
-            next_num_visible = seq_len - mask_len
-
-            if next_num_visible <= num_visible and i < num_ar_steps - 1:
-                next_num_visible = num_visible + 1
-
-            ids_to_predict = orders[:, num_visible:next_num_visible]
-            mask_to_pred = torch.zeros(bsz, seq_len, device=device, dtype=torch.bool)
-            mask_to_pred.scatter_(1, ids_to_predict.long(), True)
-
-            num_visible = next_num_visible
-
-            z = z[mask_to_pred.nonzero(as_tuple=True)]
-            xt_mask = xt_global[mask_to_pred.nonzero(as_tuple=True)]
-            y = labels.repeat(z.shape[0] // bsz)
-
-            sampled_x = denoiser.generate(xt_mask, z, y)
-
-            cur_tokens[mask_to_pred.nonzero(as_tuple=True)] = sampled_x
-
-            if args.use_logging and local_rank == 0:
-                folder = os.path.join(args.output_dir, "ar_generation_steps")
-                os.makedirs(folder, exist_ok=True)
-                file_path = os.path.join(folder, "pass{}_step_{}.png".format(pass_idx, i))
                 save_img_as_fig(unpatchify(cur_tokens, patch_size, channels=channels), file_path=file_path, size=img_size)
 
-    img = unpatchify(cur_tokens, patch_size, channels=channels)
+    if use_latent:
+        img = rae_tokenizer.decode(cur_tokens)
+    else:
+        img = unpatchify(cur_tokens, patch_size, channels=channels)
 
     return img
-
-

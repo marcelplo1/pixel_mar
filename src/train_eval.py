@@ -17,8 +17,8 @@ from utils.wandb_utils import log
 from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, unpatchify
 
 
-def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser_single, optimizer, device):
-    mae.train()
+def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single, denoiser_single, optimizer, device, rae_tokenizer=None):
+    ar_model.train()
     denoiser.train()
 
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -35,21 +35,38 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         samples, labels = batch
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        x = patchify(samples, args.patch_size)
-        x_gt = x.clone().detach()
+
+        use_latent = getattr(args, 'use_latent_space', False)
+        if use_latent and rae_tokenizer is not None:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                x_gt = rae_tokenizer.encode(samples)
+            ar_model_input = x_gt  # AR model takes RAE tokens
+        else:
+            x_gt = patchify(samples, args.patch_size)
+            ar_model_input = samples  # AR model takes images (has bottlneck patche-embedder)
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
 
         if timer:
-            timer.mark('mae_start')
+            timer.mark('ar_model_start')
+
+        recon_weight = getattr(args, 'recon_weight', 0.0)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            z, mask = mae(samples, orders, labels)
+            z, mask, x_recon = ar_model(ar_model_input, orders, labels)
 
         if timer:
-            timer.mark('mae_end')
+            timer.mark('ar_model_end')
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            loss = denoiser(x_gt, z, mask, labels)
+            denoiser_loss = denoiser(x_gt, z, mask, labels)
+
+        loss = denoiser_loss
+
+        recon_loss = None
+        if recon_weight > 0:
+            B, N, D = x_gt.shape
+            recon_loss = ((x_recon - x_gt) ** 2 * mask.unsqueeze(-1)).sum() / (mask.sum() * D + 1e-8)
+            loss = loss + recon_weight * recon_loss
 
         if timer:
             timer.mark('den_end')
@@ -65,7 +82,7 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
         if timer:
             timer.mark('opt_end')
 
-        mae_single.update_ema()
+        ar_model_single.update_ema()
         denoiser_single.update_ema()
 
         if timer:
@@ -79,8 +96,11 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
                 
             stats = {
                 "train/loss": loss.item(),
+                "train/denoiser_loss": denoiser_loss.item(),
                 "train/lr": optimizer.param_groups[0]['lr'],
             }
+            if recon_loss is not None:
+                stats["train/recon_loss"] = recon_loss.item()
 
             if args.use_wandb:
                 log(stats, step=optimizer_step)
@@ -89,24 +109,40 @@ def train_one_epoch(args, epoch, dataloader, mae, denoiser, mae_single, denoiser
     return optimizer_step
 
 @torch.no_grad()
-def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
+def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_tokenizer=None):
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
+    recon_weight = getattr(args, 'recon_weight', 0.0)
+    use_latent = getattr(args, 'use_latent_space', False)
+
     losses = []
+    recon_losses = []
     for step, batch in enumerate(val_dataloader):
         samples, labels = batch
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
-        x = patchify(samples, args.patch_size)
-        x_gt = x.clone().detach()
+
+        if use_latent and rae_tokenizer is not None:
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                x_gt = rae_tokenizer.encode(samples)
+            ar_model_input = x_gt
+        else:
+            x_gt = patchify(samples, args.patch_size)
+            ar_model_input = samples
 
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            z, mask = mae(samples, orders, labels)
-            loss = denoiser(x_gt, z, mask, labels)
-        losses.append(loss.item())
+            z, mask, x_recon = ar_model(ar_model_input, orders, labels)
+            denoiser_loss = denoiser(x_gt, z, mask, labels)
+
+        losses.append(denoiser_loss.item())
+
+        if recon_weight > 0:
+            B, N, D = x_gt.shape
+            rl = ((x_recon - x_gt) ** 2 * mask.unsqueeze(-1)).sum() / (mask.sum() * D + 1e-8)
+            recon_losses.append(rl.item())
 
     if local_rank == 0:
         if args.use_wandb:
@@ -114,12 +150,14 @@ def calc_val_loss(args, mae, denoiser, val_dataloader, epoch, device):
                 "evaluation/val_loss": sum(losses) / len(losses),
                 "epoch" : epoch
             }
+            if recon_losses:
+                stats["evaluation/val_recon_loss"] = sum(recon_losses) / len(recon_losses)
             log(stats)
 
     torch.distributed.barrier()
 
-def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=None, metrics=None):
-    mae.eval()
+def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epoch=None, metrics=None, rae_tokenizer=None):
+    ar_model.eval()
     denoiser.eval()
 
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -137,11 +175,17 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
         os.makedirs(save_folder_fid, exist_ok=True)
 
     if args.remove_ema == False:
-        print("Switch to ema")
-        for i, p in enumerate(mae.parameters()):
-            mae.ema_params[i], p.data = p.data.clone(), mae.ema_params[i]
+        # Default to the last (highest) decay
+        ema_eval_decay = getattr(args, 'ema_eval_decay', None)
+        if ema_eval_decay is not None:
+            ema_idx = ar_model.ema_decays.index(ema_eval_decay)
+        else:
+            ema_idx = len(ar_model.ema_decays) - 1
+        print(f"Switch to ema (decay={ar_model.ema_decays[ema_idx]})")
+        for i, p in enumerate(ar_model.parameters()):
+            ar_model.ema_params_list[ema_idx][i], p.data = p.data.clone(), ar_model.ema_params_list[ema_idx][i]
         for i, p in enumerate(denoiser.parameters()):
-            denoiser.ema_params[i], p.data = p.data.clone(), denoiser.ema_params[i]
+            denoiser.ema_params_list[ema_idx][i], p.data = p.data.clone(), denoiser.ema_params_list[ema_idx][i]
 
     assert args.num_images % args.class_num == 0, "Number of images per class must be the same"
     if args.has_fixed_target_class:
@@ -170,7 +214,7 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
         start_time = time.time()
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            sampled_images = sample(args, mae, denoiser, labels_gen, device, model_params, sampler_params)
+            sampled_images = sample(args, ar_model, denoiser, labels_gen, device, model_params, sampler_params, rae_tokenizer=rae_tokenizer)
 
         if step >= 1:
             torch.cuda.synchronize()
@@ -210,10 +254,10 @@ def evaluate(args, mae, denoiser, device, model_params, sampler_params, epoch=No
 
     if args.remove_ema == False:
         print("Switch back from ema")
-        for i, p in enumerate(mae.parameters()):
-            mae.ema_params[i], p.data = p.data.clone(), mae.ema_params[i]
+        for i, p in enumerate(ar_model.parameters()):
+            ar_model.ema_params_list[ema_idx][i], p.data = p.data.clone(), ar_model.ema_params_list[ema_idx][i]
         for i, p in enumerate(denoiser.parameters()):
-            denoiser.ema_params[i], p.data = p.data.clone(), denoiser.ema_params[i]
+            denoiser.ema_params_list[ema_idx][i], p.data = p.data.clone(), denoiser.ema_params_list[ema_idx][i]
         torch.cuda.empty_cache()
 
     # Evaluate the generation quality

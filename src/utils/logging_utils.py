@@ -28,17 +28,17 @@ def _print_children(module, indent=4):
         print(f"{' '*indent}{label:<36} {_fmt_params(t, a)}{frozen}")
 
 
-def log_model_parameters(mae, denoiser, device, args):
+def log_model_parameters(ar_model, denoiser, device, args):
     """Log parameter counts and GFLOPs for all model components."""
 
     print("\n" + "=" * 60)
     print(" MODEL PARAMETER & COMPUTE BREAKDOWN")
     print("=" * 60)
 
-    # --- MAE ---
-    mae_t, mae_a = _count_params(mae)
-    print(f"\n  MAE: {_fmt_params(mae_t, mae_a)}")
-    _print_children(mae)
+    # --- AR Model ---
+    ar_model_t, ar_model_a = _count_params(ar_model)
+    print(f"\n  AR Model: {_fmt_params(ar_model_t, ar_model_a)}")
+    _print_children(ar_model)
 
     # --- Denoiser ---
     den_t, den_a = _count_params(denoiser)
@@ -46,7 +46,7 @@ def log_model_parameters(mae, denoiser, device, args):
     _print_children(denoiser.denoising_net)
 
     # --- Total ---
-    total = mae_t + den_t
+    total = ar_model_t + den_t
     print(f"\n  {'─' * 58}")
     print(f"  TOTAL: {total/1e6:.2f}M trainable")
 
@@ -59,22 +59,29 @@ def log_model_parameters(mae, denoiser, device, args):
         dnet = denoiser.denoising_net
         diff_mul = denoiser.diffusion_batch_mul
 
-        was_training = mae.training
-        mae.eval()
+        was_training = ar_model.training
+        ar_model.eval()
         denoiser.eval()
 
         with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            dummy_images = torch.randn(1, args.channels, args.img_size, args.img_size, device=device)
             dummy_orders = torch.randperm(N, device=device).unsqueeze(0)
             dummy_labels = torch.zeros(1, dtype=torch.long, device=device)
 
+            # Decoder-only AR in latent space expects (B, N, latent_dim), not an image
+            latent_dim = getattr(ar_model, 'latent_dim', None)
+            if latent_dim is not None:
+                dummy_ar_model_input = torch.randn(1, N, latent_dim, device=device)
+            else:
+                dummy_ar_model_input = torch.randn(1, args.channels, args.img_size, args.img_size, device=device)
+
             with FlopCounterMode(display=False) as counter:
-                mae(dummy_images, dummy_orders, dummy_labels, num_visible=N)
-            mae_gflops = counter.get_total_flops() / 1e9
+                ar_model(dummy_ar_model_input, dummy_orders, dummy_labels, num_visible=N)
+            ar_model_gflops = counter.get_total_flops() / 1e9
 
             # Denoiser processes N * diffusion_batch_mul patches per image during training
             num_patches = N * diff_mul
-            dummy_xt = torch.randn(num_patches, D, device=device)
+            D_denoiser = dnet.embedding_dim
+            dummy_xt = torch.randn(num_patches, D_denoiser, device=device)
             dummy_z = torch.randn(num_patches, dnet.z_proj.in_features, device=device)
             dummy_t = torch.rand(num_patches, device=device)
 
@@ -83,13 +90,13 @@ def log_model_parameters(mae, denoiser, device, args):
             den_gflops = counter.get_total_flops() / 1e9
 
         if was_training:
-            mae.train()
+            ar_model.train()
             denoiser.train()
 
         print(f"\n  Training GFLOPs per image ({N} patches, diffusion_batch_mul={diff_mul}):")
-        print(f"    MAE:              {mae_gflops:>8.2f} GFLOPs")
-        print(f"    Denoiser:         {den_gflops:>8.2f} GFLOPs  ({N}x{diff_mul} = {num_patches} patches)")
-        print(f"    Total:            {(mae_gflops + den_gflops):>8.2f} GFLOPs")
+        print(f"AR Model: {ar_model_gflops:>8.2f} GFLOPs")
+        print(f"Denoiser: {den_gflops:>8.2f} GFLOPs  ({N}x{diff_mul} = {num_patches} patches)")
+        print(f"Total: {(ar_model_gflops + den_gflops):>8.2f} GFLOPs")
     except Exception as e:
         print(f"\n  (GFLOPs computation skipped: {e})")
 
@@ -100,7 +107,7 @@ class StepTimer:
     """Tracks per-step wall-clock time for each training stage. Prints and returns wandb-ready stats every `log_interval` steps.
     """
 
-    STAGES = ['data_prep', 'mae_total', 'denoiser', 'backward', 'optimizer', 'ema_update']
+    STAGES = ['data_prep', 'ar_model_total', 'denoiser', 'backward', 'optimizer', 'ema_update']
 
     def __init__(self, log_interval=50):
         self.timing = defaultdict(float)
@@ -116,9 +123,9 @@ class StepTimer:
     def end_step(self):
         """Accumulate timing for this step from marks."""
         m = self._marks
-        self.timing['data_prep'] += m['mae_start'] - m['step_start']
-        self.timing['mae_total'] += m['mae_end'] - m['mae_start']
-        self.timing['denoiser'] += m['den_end'] - m['mae_end']
+        self.timing['data_prep'] += m['ar_model_start'] - m['step_start']
+        self.timing['ar_model_total'] += m['ar_model_end'] - m['ar_model_start']
+        self.timing['denoiser'] += m['den_end'] - m['ar_model_end']
         self.timing['backward'] += m['bwd_end'] - m['den_end']
         self.timing['optimizer'] += m['opt_end'] - m['bwd_end']
         self.timing['ema_update'] += m['ema_end'] - m['opt_end']

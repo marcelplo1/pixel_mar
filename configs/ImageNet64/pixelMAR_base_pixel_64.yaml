@@ -9,13 +9,9 @@ model:
     t_eps: 5.0e-2
     sample_t_mean: 0.0
     sample_t_std: 1.0
-    time_shift_base: 4096
     diffusion_batch_mul: 4
     pred_type: 'x'  
-  mae_params:
-    encoder_dim: 768
-    encoder_depth: 12
-    encoder_num_heads: 12
+  ar_params:
     decoder_dim: 768
     decoder_depth: 12
     decoder_num_heads: 12
@@ -25,7 +21,7 @@ model:
     mask_ratio_min: 0.7
   denoiser_params:
     hidden_dim: 768
-    depth: 3
+    depth: 6
     dropout: 0.1
 
 sampler:
