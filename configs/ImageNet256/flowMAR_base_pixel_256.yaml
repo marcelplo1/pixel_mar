@@ -1,0 +1,35 @@
+model:
+  name: pixelMar_base_256
+  dataset_name: ImageNet
+  params:
+    img_size: 256
+    patch_size: 16
+    in_channels: 3
+    ema_decay: 0.9999
+    t_eps: 5.0e-2
+    sample_t_mean: 0.0
+    sample_t_std: 1.0
+    t_sampling_method: 'logit_normal'
+    diffusion_batch_mul: 1
+    pred_type: 'x'
+    bottleneck_dim: 128
+  ar_params:
+    decoder_dim: 768
+    decoder_depth: 12
+    decoder_num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+    buffer_size: 64
+    mask_ratio_min: 0.7
+  denoiser_params:
+    hidden_dim: 768
+    depth: 12
+    dropout: 0.0
+
+sampler:
+  method: 'euler'
+  num_generation_passes: 1
+  t_eps_sample: 1.0e-4
+  num_ar_steps: 64
+  num_timesteps: 100
+  noise_scale: 1.0

@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import numpy as np
+from model.ar_encoder_decoder import ArEncoderDecoder
 import torch
 import torch.distributed as dist
 import torch.optim as optim
@@ -104,10 +105,12 @@ def main():
     if args.use_wandb and global_rank == 0 and not args.evaluate:
         now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         exp_name = f"{model_name}_{dataset_name}_{args.img_size}px_{now}"   
-        initialize_wandb(args, 
-                        entity=args.wandb_entity, 
+        initialize_wandb(args,
+                        entity=args.wandb_entity,
                         exp_name=exp_name,
-                        project_name=args.wandb_project
+                        project_name=args.wandb_project,
+                        model_config=model_config,
+                        sampler_config=sampler_config
         )
 
     transform = transforms.Compose([
@@ -170,15 +173,37 @@ def main():
     rae_tokenizer = None
     latent_dim = None
     if args.use_latent_space:
-        from rae.rae_tokenizer import RaeTokenizer
-        rae_tokenizer = RaeTokenizer(
-            dinov2_path=rae_params.get('rae_encoder', 'facebook/dinov2-with-registers-base'),
-            rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
-            rae_decoder_ckp=rae_params.get('rae_decoder_ckp', None),
-            rae_norm_stats=rae_params.get('rae_norm_stats', None),
-            encoder_input_size=rae_params.get('encoder_input_size', 224),
-            decoder_patch_size=args.patch_size,
-        ).to(device)
+        latent_type = rae_params.get('latent_type', 'dinov2')
+        if latent_type == 'dinov2':
+            from rae.dinov2_tokenizer import Dinov2Tokenizer
+            rae_tokenizer = Dinov2Tokenizer(
+                dinov2_path=rae_params.get('rae_encoder', 'facebook/dinov2-with-registers-base'),
+                rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
+                rae_decoder_ckp=rae_params.get('rae_decoder_ckp', None),
+                rae_norm_stats=rae_params.get('rae_norm_stats', None),
+                encoder_input_size=rae_params.get('encoder_input_size', 224),
+                decoder_patch_size=args.patch_size,
+            ).to(device)
+        elif latent_type == 'mae':
+            from rae.mae_tokenizer import MaeTokenizer
+            rae_tokenizer = MaeTokenizer(
+                mae_path=rae_params.get('rae_encoder', 'facebook/vit-mae-base'),
+                rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
+                rae_decoder_ckp=rae_params.get('rae_decoder_ckp', None),
+                rae_norm_stats=rae_params.get('rae_norm_stats', None),
+                encoder_input_size=rae_params.get('encoder_input_size', 256),
+                decoder_patch_size=args.patch_size,
+            ).to(device)
+        elif latent_type == 'vae':
+            from rae.vae_tokenizer import VaeTokenizer
+            rae_tokenizer = VaeTokenizer(
+                vae_path=rae_params.get('vae_path', 'rae_models/vae/kl16.ckpt'),
+                embed_dim=rae_params.get('latent_dim', 16),
+                latent_scale=rae_params.get('latent_scale', 0.2325),
+                img_size=args.img_size,
+            ).to(device)
+        else:
+            raise ValueError(f"Unknown latent_type: '{latent_type}'.")
         rae_tokenizer.eval()
         latent_dim = rae_tokenizer.latent_dim
         print(f"Latent space mode: RAE dim={latent_dim}, patches={rae_tokenizer.num_patches}")
@@ -187,7 +212,8 @@ def main():
     if not isinstance(ema_decay, list):
         ema_decay = [ema_decay]
 
-    ar_model = ArDecoder(
+    ar_type = ar_params.get('ar_type', 'decoder')
+    ar_common_kwargs = dict(
         img_size=args.img_size,
         patch_size=args.patch_size,
         channels=args.channels,
@@ -198,12 +224,24 @@ def main():
         mlp_ratio=ar_params.get('mlp_ratio', 4.0),
         dropout=ar_params.get('dropout', 0.1),
         buffer_size=ar_params.get('buffer_size', 64),
-        min_mask_rate=ar_params.get('mask_ratio_min', 0.7),
+        min_mask_rate=ar_params.get('min_mask_rate', 0.7),
         num_classes=args.class_num,
         lable_dropout=args.label_drop_prob,
-        bottleneck_dim=model_params.get('bottleneck_dim', None),
-        latent_dim=rae_params.get('latent_dim', None) if rae_params else None
-    ).to(device)
+        latent_dim=rae_params.get('latent_dim', None) if rae_params else None,
+    )
+    if ar_type == 'encoder_decoder':
+        ar_model = ArEncoderDecoder(
+            **ar_common_kwargs,
+            encoder_dim=ar_params.get('encoder_dim', 768),
+            encoder_depth=ar_params.get('encoder_depth', 12),
+        ).to(device)
+    elif ar_type == 'decoder':
+        ar_model = ArDecoder(
+            **ar_common_kwargs,
+            bottleneck_dim=model_params.get('bottleneck_dim', None),
+        ).to(device)
+    else:
+        raise ValueError(f"Unknown ar_type: '{ar_type}'.")
 
     # Load denoising model from config file
     denoising_model = DenoisingModel(
@@ -233,9 +271,9 @@ def main():
         noise_scale=sampler_config.get('noise_scale', 1.0),
         ema_decay=ema_decay,
         use_logging=args.use_logging,
-        time_shift=model_params.get('time_shift', None),
-        atol=sampler_config.get('atol', 1e-5),
-        rtol=sampler_config.get('rtol', 1e-5),
+        train_shift=model_params.get('train_shift', None),
+        sample_shift=model_params.get('sample_shift', None),
+        t_sampling_method=model_params.get('t_sampling_method', 'logit_normal')
     ).to(device)
 
     # Share bottleneck embedding between AR-model and denoiser (just used in pixelspace)

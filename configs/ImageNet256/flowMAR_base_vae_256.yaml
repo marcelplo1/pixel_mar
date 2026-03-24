@@ -1,0 +1,44 @@
+model:
+  name: pixelMar_base_vae_256
+  dataset_name: ImageNet
+  params:
+    img_size: 256
+    patch_size: 16
+    in_channels: 3
+    ema_decay: [0.999, 0.9995, 0.9999]
+    t_eps: 5.0e-2
+    sample_t_mean: 0.0
+    sample_t_std: 1.0
+    train_shift: 1.0
+    sample_shift: 2.95
+    t_sampling_method: 'logit_normal'
+    diffusion_batch_mul: 1
+    pred_type: 'v'
+  rae_params:
+    latent_type: 'vae'
+    latent_dim: 16
+    vae_path: './pretrained_models/vae/kl16.ckpt'
+    latent_scale: 0.2325
+  ar_params:
+    ar_type: 'encoder_decoder'
+    encoder_dim: 768
+    encoder_depth: 12
+    decoder_dim: 768
+    decoder_depth: 12
+    decoder_num_heads: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+    buffer_size: 64
+    min_mask_rate: 0.7
+  denoiser_params:
+    hidden_dim: 768
+    depth: 6
+    dropout: 0.0
+    
+sampler:
+  method: 'heun'
+  num_generation_passes: 1
+  t_eps_sample: 1.0e-4
+  num_ar_steps: 64
+  num_timesteps: 50
+  noise_scale: 1.0

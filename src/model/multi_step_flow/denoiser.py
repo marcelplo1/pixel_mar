@@ -24,9 +24,9 @@ class Denoiser(nn.Module):
         ema_decay = 0.9999,
         use_logging=False,
         use_latent_space=False,
-        time_shift=None,
-        atol=1e-5,
-        rtol=1e-5
+        train_shift=None,
+        sample_shift=None,
+        t_sampling_method='logit_normal'
     ):
         super().__init__()
 
@@ -36,6 +36,7 @@ class Denoiser(nn.Module):
         self.channels = denoising_model.in_channels
         self.patch_size = denoising_model.patch_size
 
+        self.t_sampling_method = t_sampling_method
         self.P_mean = sample_t_mean
         self.P_std = sample_t_std
         self.t_eps = t_eps
@@ -52,27 +53,58 @@ class Denoiser(nn.Module):
         self.ema_decays = ema_decay if isinstance(ema_decay, list) else [ema_decay]
         self.diffusion_batch_mul = diffusion_batch_mul
 
-        self.time_shift = time_shift
-        self.atol = atol
-        self.rtol = rtol
+        self.train_shift = train_shift
+        self.sample_shift = sample_shift
         self.ema_params_list = None
         self.log_counter = 0
         self.log_batch_pred = 100
 
-    def _shift_t(self, t):
+    def _shift_t(self, t, shift):
         """Apply time shift."""
         s = 1.0 - t
-        s = self.time_shift * s / (1.0 + (self.time_shift - 1.0) * s)
+        s = shift * s / (1.0 + (shift - 1.0) * s)
         return 1.0 - s
 
-    def sample_t(self, n: int, device=None):  # lognormal distribution
-        """Log normal time sampling"""
+    def sample_t(self, n: int, device=None):
+        if self.t_sampling_method == 'uniform':
+            return self.sample_t_uniform(n, device)
+        elif self.t_sampling_method == 'logit_normal':
+            return self.sample_t_logit_normal(n, device)
+        elif self.t_sampling_method == 'plateau_logit_normal':
+            return self.sample_t_plateau_logit_normal(n, device)
+        else:
+            raise ValueError(f"Unknown t_sampling_method: '{self.t_sampling_method}'.")
+
+    def sample_t_uniform(self, n: int, device=None):
+        """Uniform timestep sampling over [0, 1]."""
+        t = torch.rand(n, device=device)
+        if self.train_shift is not None:
+            return self._shift_t(t, self.train_shift)
+        return t
+
+    def sample_t_logit_normal(self, n: int, device=None):
+        """Logit-normal"""
         t = torch.randn(n, device=device) * self.P_std + self.P_mean
         t = torch.sigmoid(t)
-        if self.time_shift is not None:
-            return self._shift_t(t)
-        else:
-            return t
+        if self.train_shift is not None:
+            return self._shift_t(t, self.train_shift)
+        return t
+
+    def sample_t_plateau_logit_normal(self, n: int, device=None):
+        """Plateau-logit-normal, uniform plateau [mode, 1-eps]."""
+        noise = torch.randn(n, device=device)
+        t_gaussian = noise * self.P_std + self.P_mean
+        eps = 1e-3
+
+        t_logit = torch.sigmoid(t_gaussian)
+        t_star = torch.sigmoid(torch.tensor(self.P_mean, device=device))
+
+        t_uniform = torch.rand(n, device=device) * (1.0 - eps - t_star) + t_star
+        t = torch.where(t_logit > t_star, t_uniform, t_logit)
+
+        if self.train_shift is not None:
+            return self._shift_t(t, self.train_shift)
+        return t
 
     def forward(self, x, z, mask, labels):
         B, N, D = x.shape
@@ -143,12 +175,8 @@ class Denoiser(nn.Module):
         device = z.device
         bsz = xt.size(0)
         timesteps = torch.linspace(self.t_eps_sample, 1.0 - self.t_eps_sample, self.steps+1, device=device)
-        if self.time_shift is not None:
-            timesteps = self._shift_t(timesteps)
-
-        # TODO: Remove the test method and itegrate it with fixed ODEs
-        if self.method == 'dopri5':
-            return self._generate_adaptive(xt, z, timesteps, z_uncond, cfg_scale, cfg_interval)
+        if self.sample_shift is not None:
+            timesteps = self._shift_t(timesteps, self.sample_shift)
 
         timesteps = timesteps.view(-1, 1, 1).expand(-1, bsz, 1)
 
@@ -166,25 +194,6 @@ class Denoiser(nn.Module):
             xt = stepper(xt, z, t, t_next, z_uncond, cfg_scale, cfg_interval)
         xt = self._euler_step(xt, z, timesteps[-2], timesteps[-1], z_uncond, cfg_scale, cfg_interval)
         return xt
-
-    @torch.no_grad()
-    def _generate_adaptive(self, xt, z, t_span, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
-        from torchdiffeq import odeint
-
-        def drift_fn(t, x):
-            t_batch = t.expand(x.size(0)).unsqueeze(-1)
-            return self._forward_sample(x, z, t_batch, z_uncond, cfg_scale, cfg_interval)
-
-        trajectory = odeint(
-            drift_fn,
-            xt,
-            t_span,
-            method=self.method,
-            atol=self.atol,
-            rtol=self.rtol,
-        )
-
-        return trajectory[-1]
 
     def _pred_to_velocity(self, pred, xt, t):
         if self.pred_type == 'v':
