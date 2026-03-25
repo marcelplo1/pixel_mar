@@ -5,7 +5,7 @@ model:
     img_size: 256
     patch_size: 16
     in_channels: 3
-    ema_decay: 0.9999
+    ema_decay: [0.999, 0.9995, 0.9999]
     t_eps: 5.0e-2
     sample_t_mean: 0.0
     sample_t_std: 1.0

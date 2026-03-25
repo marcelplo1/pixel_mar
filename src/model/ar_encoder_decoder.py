@@ -26,7 +26,6 @@ class ArEncoderDecoder(nn.Module):
     """
     Encoder-decoder variant: encoder processes only visible patches (variable length),
     decoder receives encoded visible + mask tokens and produces full-sequence latents.
-    Encoder and decoder share the same hidden dimension.
     """
     def __init__(
             self,
@@ -46,12 +45,14 @@ class ArEncoderDecoder(nn.Module):
             min_mask_rate=0.7,
             lable_dropout=0.1,
             bottleneck_dim=None,
-            latent_dim=None
+            latent_dim=None,
+            gt_noise_scale=0.0
         ):
         super().__init__()
 
         self.patch_size = patch_size
         self.min_mask_rate = min_mask_rate
+        self.gt_noise_scale = gt_noise_scale
         self.buffer_size = buffer_size
         self.decoder_dim = decoder_dim
         self.encoder_dim = encoder_dim
@@ -96,6 +97,7 @@ class ArEncoderDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(self.decoder_dim, eps=1e-6)
 
         self.reconstruction_head = nn.Linear(self.decoder_dim, self.embed_dim)
+        self.diffusion_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len, self.decoder_dim))
 
         self.label_drop_prob = lable_dropout
         self.ema_decays = ema_decay if isinstance(ema_decay, list) else [ema_decay]
@@ -139,6 +141,7 @@ class ArEncoderDecoder(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
         nn.init.trunc_normal_(self.fake_latent, std=0.02)
+        nn.init.normal_(self.diffusion_pos_emb, std=0.02)
 
     def forward_encoder(self, x, orders, num_visible, class_emb, force_unconditional=False):
         """
@@ -200,6 +203,7 @@ class ArEncoderDecoder(nn.Module):
 
         z = self.decoder_norm(x)
         z = z[:, self.buffer_size:]
+        z = z + self.diffusion_pos_emb
 
         return z
 
@@ -213,6 +217,10 @@ class ArEncoderDecoder(nn.Module):
             mask = self.random_masking(x, mask_orders, self.min_mask_rate)
             num_masked = int(mask[0].sum().item())
             num_vis = N - num_masked
+            # Mask-ratio-dependent noise: more noise when fewer patches are masked
+            if self.gt_noise_scale > 0:
+                visible_ratio = num_vis / N
+                x = x + self.gt_noise_scale * visible_ratio * torch.randn_like(x)
             x = self.forward_encoder(x, mask_orders, num_vis, class_embedding, force_unconditional=force_unconditional)
         else:
             mask = torch.zeros(B, N, device=x.device)

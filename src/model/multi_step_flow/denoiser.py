@@ -108,7 +108,7 @@ class Denoiser(nn.Module):
 
     def forward(self, x, z, mask, labels):
         B, N, D = x.shape
-        x = x.view(B*N, -1).repeat(self.diffusion_batch_mul, 1)
+        x = x.reshape(B*N, -1).repeat(self.diffusion_batch_mul, 1)
         z = z.reshape(B*N, -1).repeat(self.diffusion_batch_mul, 1)
         labels = labels.repeat(self.diffusion_batch_mul*N)
         mask = mask.reshape(B*N).repeat(self.diffusion_batch_mul)

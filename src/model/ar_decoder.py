@@ -3,7 +3,7 @@ from scipy import stats
 import torch
 import torch.nn as nn
 
-from model.model_utils import Attention, RMSNorm, SwiGLUFFN, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
+from model.model_utils import Attention, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
 from utils.utils import patchify
 
 
@@ -65,12 +65,14 @@ class ArDecoder(nn.Module):
             min_mask_rate = 0.7,
             lable_dropout = 0.1,
             bottleneck_dim = None,
-            latent_dim = None
+            latent_dim = None,
+            gt_noise_scale = 0.0
         ):
         super().__init__()
 
         self.patch_size = patch_size
         self.min_mask_rate = min_mask_rate
+        self.gt_noise_scale = gt_noise_scale
         self.buffer_size = buffer_size
         self.decoder_dim = decoder_dim
         self.img_size = img_size
@@ -91,6 +93,7 @@ class ArDecoder(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         self.class_emb = nn.Embedding(num_classes, decoder_dim)
         self.fake_latent = nn.Parameter(torch.zeros(1, decoder_dim))
+        self.mask_rate_emb = TimestepEmbedder(decoder_dim)
 
         self.decoder_pos_emb = nn.Parameter(
             torch.zeros(1, self.seq_len + self.buffer_size, decoder_dim), requires_grad=True
@@ -104,6 +107,7 @@ class ArDecoder(nn.Module):
         self.decoder_norm = nn.LayerNorm(decoder_dim, eps=1e-6)
 
         self.reconstruction_head = nn.Linear(decoder_dim, self.embed_dim)
+        self.diffusion_pos_emb = nn.Parameter(torch.zeros(1, self.seq_len, decoder_dim))
 
         self.label_drop_prob = lable_dropout
         self.ema_decays = ema_decay if isinstance(ema_decay, list) else [ema_decay]
@@ -141,6 +145,10 @@ class ArDecoder(nn.Module):
         nn.init.trunc_normal_(self.mask_token, std=0.02)
         nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
         nn.init.trunc_normal_(self.fake_latent, std=0.02)
+        nn.init.normal_(self.diffusion_pos_emb, std=0.02)
+
+        nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.mask_rate_emb.mlp[2].weight, std=0.02)
 
         # Initialize patch_embed for pixelspace:
         if isinstance(self.x_proj, BottleneckPatchEmbed):
@@ -168,10 +176,17 @@ class ArDecoder(nn.Module):
             mask = self.random_masking(x, mask_orders, self.min_mask_rate)
             num_masked = int(mask[0].sum().item())
             num_vis = N - num_masked
+            # Mask-ratio-dependent noise: more noise when fewer patches are masked
+            if self.gt_noise_scale > 0:
+                visible_ratio = num_vis / N
+                x = x + self.gt_noise_scale * visible_ratio * torch.randn_like(x)
         else:
             mask = torch.zeros(B, N, device=x.device)
             mask.scatter_(1, mask_orders[:, num_visible:].long(), 1.0)
             num_vis = num_visible
+
+        mask_rate = torch.tensor([1.0 - num_vis / N], device=x.device)
+        mask_rate_embedding = self.mask_rate_emb(mask_rate).expand(B, -1)
 
         ids_restore = torch.argsort(mask_orders, dim=1)
 
@@ -185,7 +200,8 @@ class ArDecoder(nn.Module):
 
         # Buffer tokens carrying class conditioning
         buffer = torch.zeros(B, self.buffer_size, self.decoder_dim, device=x.device, dtype=x.dtype)
-        buffer[:] = class_embedding.unsqueeze(1)
+        buffer[:, :self.buffer_size//2] = class_embedding.unsqueeze(1)
+        buffer[:, self.buffer_size//2:] = mask_rate_embedding.unsqueeze(1)
         x = torch.cat([buffer, x_full], dim=1)  # (B, buffer_size + N, decoder_dim)
 
         x = x + self.decoder_pos_emb
@@ -195,6 +211,7 @@ class ArDecoder(nn.Module):
 
         z = self.decoder_norm(x)
         z = z[:, self.buffer_size:]
+        z = z + self.diffusion_pos_emb
 
         x_recon = self.reconstruction_head(z)
 

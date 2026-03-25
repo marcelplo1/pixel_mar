@@ -30,6 +30,7 @@ model:
     mlp_ratio: 4.0
     dropout: 0.0
     buffer_size: 64
+    gt_noise_scale: 0.0
     min_mask_rate: 0.7
   denoiser_params:
     hidden_dim: 768

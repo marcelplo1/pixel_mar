@@ -17,7 +17,7 @@ model:
   rae_params:
     latent_type: 'vae'
     latent_dim: 16
-    vae_path: './pretrained_models/vae/kl16.ckpt'
+    vae_path: './rea_models/vae/kl16.ckpt'
     latent_scale: 0.2325
   ar_params:
     ar_type: 'encoder_decoder'

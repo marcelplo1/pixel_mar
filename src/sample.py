@@ -72,7 +72,9 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
         xt_mask = xt_global[pred_indices]
         y = labels.repeat(z_c.shape[0] // bsz)
 
-        sampled_x = denoiser.generate(xt_mask, z_c, y, z_uncond=z_u, cfg_scale=cfg_scale, cfg_interval=cfg_interval)
+        # Linear CFG schedule (following MAR): ramp from 1.0 to cfg_scale as more tokens become visible
+        cfg_scale_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
+        sampled_x = denoiser.generate(xt_mask, z_c, y, z_uncond=z_u, cfg_scale=cfg_scale_iter, cfg_interval=cfg_interval)
         cur_tokens[pred_indices] = sampled_x
 
         if args.use_logging and local_rank == 0:

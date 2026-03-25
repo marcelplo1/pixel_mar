@@ -4,6 +4,7 @@ import os
 import numpy as np
 from model.ar_encoder_decoder import ArEncoderDecoder
 import torch
+import torch.nn as nn
 import torch.distributed as dist
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset, ConcatDataset, DistributedSampler
@@ -225,6 +226,7 @@ def main():
         dropout=ar_params.get('dropout', 0.1),
         buffer_size=ar_params.get('buffer_size', 64),
         min_mask_rate=ar_params.get('min_mask_rate', 0.7),
+        gt_noise_scale=ar_params.get('gt_noise_scale', 0.0),
         num_classes=args.class_num,
         lable_dropout=args.label_drop_prob,
         latent_dim=rae_params.get('latent_dim', None) if rae_params else None,
@@ -254,7 +256,8 @@ def main():
         z_hidden_dim=ar_params.get('decoder_dim', 768),
         num_classes=args.class_num,
         denoiser_type=args.denoiser_type,
-        bottleneck_dim=model_params.get('bottleneck_dim', None)
+        bottleneck_dim=model_params.get('bottleneck_dim', None),
+        latent_dim=latent_dim
     )
     #Load denoiser from config file
     denoiser = Denoiser(
@@ -307,12 +310,16 @@ def main():
         checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
 
         if 'ar_model' in checkpoint:
-            ar_model_single.load_state_dict(checkpoint['ar_model'])
+            missing = ar_model_single.load_state_dict(checkpoint['ar_model'], strict=False).missing_keys
             ema_ar_raw = checkpoint['ema_ar_model']
         else:
-            ar_model_single.load_state_dict(checkpoint['mae'])
+            missing = ar_model_single.load_state_dict(checkpoint['mae'], strict=False).missing_keys
             ema_ar_raw = checkpoint['ema_mae']
-        denoiser_single.load_state_dict(checkpoint['denoiser'])
+        #TODO: Change in the final code. Zero out params missing from old checkpoints so they act as no-ops
+        for key in missing:
+            print(f"  Zeroing missing key: {key}")
+            nn.init.zeros_(dict(ar_model_single.named_parameters())[key])
+        denoiser_single.load_state_dict(checkpoint['denoiser'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer'])
         ema_den_raw = checkpoint['ema_denoiser']
 

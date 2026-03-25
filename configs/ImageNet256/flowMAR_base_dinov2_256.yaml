@@ -5,13 +5,13 @@ model:
     img_size: 256
     patch_size: 16
     in_channels: 3
-    ema_decay: 0.9999
+    ema_decay: [0.999, 0.9995, 0.9999]
     t_eps: 5.0e-2
     sample_t_mean: 0.0
     sample_t_std: 1.0
     train_shift: 10.0
     sample_shift: 10.0
-    t_sampling_method: 'logit_normal'
+    t_sampling_method: 'plateau_logit_normal'
     diffusion_batch_mul: 1
     pred_type: 'x' 
   rae_params:
@@ -29,7 +29,7 @@ model:
     mlp_ratio: 4.0
     dropout: 0.0
     buffer_size: 64
-    mask_ratio_min: 0.7
+    mask_ratio_min: 0.0
   denoiser_params:
     hidden_dim: 768
     depth: 6

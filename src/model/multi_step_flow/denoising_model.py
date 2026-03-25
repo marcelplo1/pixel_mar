@@ -29,10 +29,10 @@ class FinalLayer(nn.Module):
     """
     The final layer.
     """
-    def __init__(self, hidden_dim, patch_size, out_channels):
+    def __init__(self, hidden_dim, out_dim):
         super().__init__()
         self.norm_final = RMSNorm(hidden_dim)
-        self.linear = nn.Linear(hidden_dim, patch_size * patch_size * out_channels, bias=True)
+        self.linear = nn.Linear(hidden_dim, out_dim, bias=True)
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_dim, 2 * hidden_dim, bias=True)
@@ -105,7 +105,8 @@ class DenoisingModel(nn.Module):
         dropout=0.0,
         z_hidden_dim=768,
         denoiser_type = 'ada_ln',
-        bottleneck_dim=None
+        bottleneck_dim=None,
+        latent_dim=None
     ):
         super().__init__()
         self.in_channels = channels
@@ -116,7 +117,7 @@ class DenoisingModel(nn.Module):
         self.img_size = img_size
         self.denoiser_type = denoiser_type
 
-        self.embedding_dim = channels * patch_size**2
+        self.embedding_dim = latent_dim if latent_dim is not None else channels * patch_size**2
         self.num_patches = (img_size // patch_size) ** 2
 
         if bottleneck_dim is not None:
@@ -131,7 +132,7 @@ class DenoisingModel(nn.Module):
                 ResBlock(hidden_dim)
                 for i in range(depth)
             ])
-            self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
+            self.final_layer = FinalLayer(hidden_dim, self.embedding_dim)
             self.initialize_weights_ada_ln()
         elif denoiser_type == 'in_context':
             self.blocks = nn.ModuleList([
@@ -145,14 +146,14 @@ class DenoisingModel(nn.Module):
                 AttenBlock(hidden_dim, hidden_dim // 64)
                 for i in range(depth)
             ])
-            self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
+            self.final_layer = FinalLayer(hidden_dim, self.embedding_dim)
             self.initialize__attn_weights()
         elif denoiser_type == 'add':
             self.blocks = nn.ModuleList([
                 AttenBlock(hidden_dim, hidden_dim // 64)
                 for i in range(depth)
             ])
-            self.final_layer = FinalLayer(hidden_dim, patch_size, channels)
+            self.final_layer = FinalLayer(hidden_dim, self.embedding_dim)
             self.initialize__attn_weights()
         
     def initialize__attn_weights(self):
