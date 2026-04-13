@@ -15,15 +15,13 @@ from PIL import Image
 
 def adjust_learning_rate(optimizer, epoch, args):
     """Decay the learning rate with half-cycle cosine after warmup"""
-    min_lr = 0.0
-    lr_schedule = "constant"
     if epoch < args.warmup_epochs:
-        lr = args.lr * epoch / args.warmup_epochs 
+        lr = args.lr * epoch / args.warmup_epochs
     else:
-        if lr_schedule == "constant":
+        if args.lr_schedule == "constant":
             lr = args.lr
-        elif lr_schedule == "cosine":
-            lr = min_lr + (args.lr - min_lr) * 0.5 * \
+        elif args.lr_schedule == "cosine":
+            lr = args.min_lr + (args.lr - args.min_lr) * 0.5 * \
                 (1. + math.cos(math.pi * (epoch - args.warmup_epochs) / (args.epochs - args.warmup_epochs)))
         else:
             raise NotImplementedError
@@ -62,14 +60,22 @@ def unpatchify(x, p, channels=3):
     imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
     return imgs
 
-def sample_order(bsz, seq_len, device):
-    orders = []
-    for _ in range(bsz):
-        order = np.arange(seq_len)
-        np.random.shuffle(order)
-        orders.append(order)
-    orders = torch.tensor(np.array(orders), device=device)
-    return orders
+def sample_order(bsz, seq_len, device, strategy='random'):
+    """Generate token ordering for AR generation.
+    """
+    if strategy == 'random' or strategy is None:
+        orders = []
+        for _ in range(bsz):
+            order = np.arange(seq_len)
+            np.random.shuffle(order)
+            orders.append(order)
+        return torch.tensor(np.array(orders), device=device)
+    elif strategy == 'raster':
+        order = list(range(seq_len))
+        order = torch.tensor(order, device=device).unsqueeze(0).expand(bsz, -1)
+        return order
+
+    raise ValueError(f"Unknown order strategy: {strategy}")
 
 def save_img_as_fig(x, file_path, size=32):
     with torch.no_grad():

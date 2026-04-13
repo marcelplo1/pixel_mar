@@ -1,3 +1,4 @@
+import math
 import numpy as np
 from scipy import stats
 import torch
@@ -61,19 +62,25 @@ class ArDecoder(nn.Module):
             decoder_num_heads=12,
             mlp_ratio=4.0,
             dropout=0.1,
-            buffer_size=64,
+            class_token_size=16,
+            mask_rate_token_size=8,
             min_mask_rate = 0.7,
+            min_s = 0.0,
             lable_dropout = 0.1,
             bottleneck_dim = None,
             latent_dim = None,
-            gt_noise_scale = 0.0
+            gt_noise_scale = 0.0,
+            mask_condition = None,
+            train_mask_schedule = 'truncnorm'
+
         ):
         super().__init__()
 
         self.patch_size = patch_size
         self.min_mask_rate = min_mask_rate
+        self.min_s = min_s
+        self.train_mask_schedule = train_mask_schedule
         self.gt_noise_scale = gt_noise_scale
-        self.buffer_size = buffer_size
         self.decoder_dim = decoder_dim
         self.img_size = img_size
         self.channels = channels
@@ -81,6 +88,10 @@ class ArDecoder(nn.Module):
         
         self.latent_dim = latent_dim
         self.embed_dim = latent_dim if latent_dim is not None else channels * patch_size**2
+
+        self.class_token_size = class_token_size
+        self.mask_rate_token_size = mask_rate_token_size if mask_condition else 0
+        self.total_c_token_size = class_token_size + self.mask_rate_token_size
         
         if latent_dim is None:
             # Pixel mode
@@ -93,10 +104,12 @@ class ArDecoder(nn.Module):
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         self.class_emb = nn.Embedding(num_classes, decoder_dim)
         self.fake_latent = nn.Parameter(torch.zeros(1, decoder_dim))
-        self.mask_rate_emb = TimestepEmbedder(decoder_dim)
+
+        # Extra Embeddings
+        self.mask_rate_emb = TimestepEmbedder(decoder_dim) if mask_condition else None
 
         self.decoder_pos_emb = nn.Parameter(
-            torch.zeros(1, self.seq_len + self.buffer_size, decoder_dim), requires_grad=True
+            torch.zeros(1, self.seq_len + self.total_c_token_size, decoder_dim), requires_grad=True
         )
 
         self.decoder_block = nn.ModuleList([
@@ -121,7 +134,7 @@ class ArDecoder(nn.Module):
         self.decoder_rope = VisionRotaryEmbeddingFast(
             dim=half_head_dim,
             pt_seq_len=hw_seq_len,
-            num_cls_token=self.buffer_size
+            num_cls_token=self.total_c_token_size
         )
 
     def initialize_weights(self):
@@ -138,8 +151,8 @@ class ArDecoder(nn.Module):
 
         grid_size = int(self.seq_len ** 0.5)
         pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.buffer_size, self.decoder_dim)
-        full_pos_embed[self.buffer_size:, :] = torch.from_numpy(pos_embed_grid).float()
+        full_pos_embed = torch.zeros(self.seq_len + self.total_c_token_size, self.decoder_dim)
+        full_pos_embed[self.total_c_token_size:, :] = torch.from_numpy(pos_embed_grid).float()
         self.decoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
 
         nn.init.trunc_normal_(self.mask_token, std=0.02)
@@ -147,8 +160,9 @@ class ArDecoder(nn.Module):
         nn.init.trunc_normal_(self.fake_latent, std=0.02)
         nn.init.normal_(self.diffusion_pos_emb, std=0.02)
 
-        nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.mask_rate_emb.mlp[2].weight, std=0.02)
+        if self.mask_rate_emb is not None:
+            nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)
+            nn.init.normal_(self.mask_rate_emb.mlp[2].weight, std=0.02)
 
         # Initialize patch_embed for pixelspace:
         if isinstance(self.x_proj, BottleneckPatchEmbed):
@@ -158,22 +172,22 @@ class ArDecoder(nn.Module):
             nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
             nn.init.constant_(self.x_proj.proj2.bias, 0)
 
-    def forward(self, x, mask_orders, labels, num_visible=None, force_unconditional=False, return_intermediates=False):
+    def forward(self, x, mask_orders=None, labels=None, num_visible=None, force_unconditional=False, return_intermediates=False):
         x = self.x_proj(x)  # (B, N, decoder_dim)
         x_emb = x.clone().detach()
         B, N, D = x.shape
 
-        # Class conditioning with label dropout for CFG
+        # Class conditioning
         if force_unconditional:
             class_embedding = self.fake_latent.expand(B, -1)
         else:
             class_embedding = self.class_emb(labels)
-            if self.training:
+            if self.training and self.label_drop_prob > 0:
                 drop_mask = (torch.rand(B, device=x.device) < self.label_drop_prob).unsqueeze(-1).to(x.dtype)
                 class_embedding = drop_mask * self.fake_latent + (1 - drop_mask) * class_embedding
 
         if self.training:
-            mask = self.random_masking(x, mask_orders, self.min_mask_rate)
+            mask = self.random_masking(x, self.min_mask_rate, self.min_s)
             num_masked = int(mask[0].sum().item())
             num_vis = N - num_masked
             # Mask-ratio-dependent noise: more noise when fewer patches are masked
@@ -181,28 +195,25 @@ class ArDecoder(nn.Module):
                 visible_ratio = num_vis / N
                 x = x + self.gt_noise_scale * visible_ratio * torch.randn_like(x)
         else:
-            mask = torch.zeros(B, N, device=x.device)
-            mask.scatter_(1, mask_orders[:, num_visible:].long(), 1.0)
             num_vis = num_visible
+            mask = torch.zeros(B, N, device=x.device)
+            mask.scatter_(1, mask_orders[:, num_vis:].long(), 1.0)
 
-        mask_rate = torch.tensor([1.0 - num_vis / N], device=x.device)
-        mask_rate_embedding = self.mask_rate_emb(mask_rate).expand(B, -1)
+        if self.mask_rate_emb is not None:
+            mask_rate = torch.tensor([1.0 - num_vis / N], device=x.device)
+            mask_rate_embedding = self.mask_rate_emb(mask_rate).expand(B, -1)
 
-        ids_restore = torch.argsort(mask_orders, dim=1)
+        # Replace masked positions with the learnable mask token
+        mask_tokens = self.mask_token.to(x.dtype).expand(B, N, -1)
+        x_full = torch.where(mask.unsqueeze(-1).bool(), mask_tokens, x)
 
-        # Reorder by mask_orders and replace masked with mask_token
-        x = torch.gather(x, dim=1, index=mask_orders.unsqueeze(-1).expand(-1, -1, self.decoder_dim))
-        x_visible = x[:, :num_vis, :]
-        mask_tokens = self.mask_token.repeat(B, N - num_vis, 1).to(x.dtype)
-
-        x_full = torch.cat([x_visible, mask_tokens], dim=1)
-        x_full = torch.gather(x_full, dim=1, index=ids_restore.unsqueeze(-1).expand(-1, -1, self.decoder_dim))
-
-        # Buffer tokens carrying class conditioning
-        buffer = torch.zeros(B, self.buffer_size, self.decoder_dim, device=x.device, dtype=x.dtype)
-        buffer[:, :self.buffer_size//2] = class_embedding.unsqueeze(1)
-        buffer[:, self.buffer_size//2:] = mask_rate_embedding.unsqueeze(1)
-        x = torch.cat([buffer, x_full], dim=1)  # (B, buffer_size + N, decoder_dim)
+        class_tokens = torch.zeros(B, self.class_token_size, self.decoder_dim, device=x.device, dtype=x.dtype)
+        class_tokens[:, :self.class_token_size] = class_embedding.unsqueeze(1)
+        if self.mask_rate_emb is not None:
+            mask_rate_tokens = mask_rate_embedding.unsqueeze(1).expand(B, self.mask_rate_token_size, -1)
+            x = torch.cat([class_tokens, mask_rate_tokens, x_full], dim=1)
+        else:
+            x = torch.cat([class_tokens, x_full], dim=1)
 
         x = x + self.decoder_pos_emb
 
@@ -210,20 +221,50 @@ class ArDecoder(nn.Module):
             x = block(x, self.decoder_rope)
 
         z = self.decoder_norm(x)
-        z = z[:, self.buffer_size:]
+        z = z[:, self.total_c_token_size:]
         z = z + self.diffusion_pos_emb
 
         x_recon = self.reconstruction_head(z)
 
         return z, mask, x_recon
 
-    def random_masking(self, x, orders, min_mask_rate=0.7):
+    def random_masking(self, x, min_mask_rate=0.7, min_s=0.2):
         bsz, seq_len, embed_dim = x.shape
-        mask_rate = stats.truncnorm((min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]
-        num_masked_tokens = int(np.ceil(seq_len * mask_rate))
-        mask = torch.zeros(bsz, seq_len, device=x.device)
-        mask = torch.scatter(mask, dim=-1, index=orders[:, :num_masked_tokens],
-                             src=torch.ones(bsz, seq_len, device=x.device))
+        if self.train_mask_schedule == 'exp':
+            eps = 1e-3
+            valid_mask_generated = False
+            while not valid_mask_generated:
+                t = torch.rand((), device=x.device)
+                t = torch.clamp(t, min=min_s)
+                p_mask = (1 - eps) * t + eps
+                p_mask = p_mask.expand(seq_len)
+                random_vals = torch.rand((seq_len,), device=x.device)
+                mask_prob = 1 - torch.exp(-5 * p_mask)
+                mask = (random_vals < mask_prob).float()
+                if mask.sum() >= 2:
+                    valid_mask_generated = True
+        elif self.train_mask_schedule == 'exp_v2':
+            eps = 1e-3
+            valid_mask_generated = False
+            while not valid_mask_generated:
+                t = (1.0 - min_s) * torch.rand((), device=x.device) + min_s
+                p_mask = (1 - eps) * t + eps
+                p_mask = p_mask.expand(seq_len)
+                random_vals = torch.rand((seq_len,), device=x.device)
+                mask_prob = 1 - torch.exp(-5 * p_mask)
+                mask = (random_vals < mask_prob).float()
+                if mask.sum() >= 0: #TODO explore the min number of tokens
+                    valid_mask_generated = True
+        else:  # truncnorm (default)
+            mask_rate = stats.truncnorm((min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]
+            num_masked_tokens = int(np.ceil(seq_len * mask_rate))
+            mask = torch.zeros(seq_len, device=x.device)
+            mask[:num_masked_tokens] = 1.0
+
+        mask = mask.expand(bsz, -1).clone()
+        for i in range(bsz):
+            random_indices = torch.randperm(seq_len, device=x.device)
+            mask[i] = mask[i][random_indices]
         return mask
 
     @torch.no_grad()

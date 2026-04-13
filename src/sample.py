@@ -10,6 +10,35 @@ def mask_by_order(mask_len, order, bsz, seq_len, device ):
     masking = torch.scatter(masking, dim=-1, index=order[:, :mask_len.long()], src=torch.ones(bsz, seq_len, device=device))
     return masking
 
+def compute_mask_schedule(schedule_type, num_ar_steps, seq_len):
+    """Compute the list of cumulative visible token counts for each AR step.
+    """
+    if schedule_type == 'exp':
+        schedule = []
+        prev = 0
+        for i in range(num_ar_steps):
+            t = 1.0 - (i + 1) / num_ar_steps
+            mask_ratio = 1.0 - np.exp(-5.0 * t)
+            mask_len = int(np.floor(seq_len * mask_ratio))
+            num_visible = seq_len - mask_len
+            if num_visible <= prev and i < num_ar_steps - 1:
+                num_visible = prev + 1
+            schedule.append(num_visible)
+            prev = num_visible
+        return schedule
+    else:  # cosine (default)
+        schedule = []
+        prev = 0
+        for i in range(num_ar_steps):
+            mask_ratio = np.cos(math.pi / 2.0 * (i + 1) / num_ar_steps)
+            mask_len = int(np.floor(seq_len * mask_ratio))
+            num_visible = seq_len - mask_len
+            if num_visible <= prev and i < num_ar_steps - 1:
+                num_visible = prev + 1
+            schedule.append(num_visible)
+            prev = num_visible
+        return schedule
+
 @torch.no_grad()
 def sample(args, ar_model, denoiser, labels, device, model_params, sampler_params, rae_tokenizer=None):
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
@@ -39,9 +68,12 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
     num_generation_passes = sampler_params.get('num_generation_passes', 1)
 
     # --- Pass 0: autoregressive generation ---
+    mask_schedule_type = sampler_params.get('mask_schedule', 'cosine')
+    schedule = compute_mask_schedule(mask_schedule_type, num_ar_steps, seq_len)
+
     xt_global = noise_scale * torch.randn(bsz, seq_len, embed_dim, device=device)
     num_visible = 0
-    for i in range(num_ar_steps):
+    for i, next_num_visible in enumerate(schedule):
         if use_latent:
             ar_model_input = cur_tokens
         else:
@@ -53,13 +85,6 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
         else:
             z_cond, mask, _ = ar_model(ar_model_input, orders, labels, num_visible)
             z_uncond = None
-
-        mask_ratio = np.cos(math.pi / 2. * (i + 1) / num_ar_steps)
-        mask_len = int(np.floor(seq_len * mask_ratio))
-        next_num_visible = seq_len - mask_len
-
-        if next_num_visible <= num_visible and i < num_ar_steps - 1:
-            next_num_visible = num_visible + 1
 
         ids_to_predict = orders[:, num_visible:next_num_visible]
         mask_to_pred = torch.zeros(bsz, seq_len, device=device, dtype=torch.bool)
@@ -73,7 +98,8 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
         y = labels.repeat(z_c.shape[0] // bsz)
 
         # Linear CFG schedule (following MAR): ramp from 1.0 to cfg_scale as more tokens become visible
-        cfg_scale_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
+        #cfg_scale_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
+        cfg_scale_iter = cfg_scale
         sampled_x = denoiser.generate(xt_mask, z_c, y, z_uncond=z_u, cfg_scale=cfg_scale_iter, cfg_interval=cfg_interval)
         cur_tokens[pred_indices] = sampled_x
 

@@ -60,10 +60,25 @@ class Denoiser(nn.Module):
         self.log_batch_pred = 100
 
     def _shift_t(self, t, shift):
-        """Apply time shift."""
-        s = 1.0 - t
-        s = shift * s / (1.0 + (shift - 1.0) * s)
-        return 1.0 - s
+        """Apply time shift (t=0 clean, t=1 noise)."""
+        t = shift * t / (1.0 + (shift - 1.0) * t)
+        return t
+
+    def sample_t_plateau_logit_normal(self, n: int, device=None):
+        """Plateau-logit-normal, uniform plateau [mode, 1-eps]."""
+        noise = torch.randn(n, device=device)
+        t_gaussian = noise * self.P_std + self.P_mean
+        eps = 1e-3
+
+        t_logit = torch.sigmoid(t_gaussian)
+        t_star = torch.sigmoid(torch.tensor(self.P_mean, device=device))
+
+        t_uniform = torch.rand(n, device=device) * (1.0 - eps - t_star) + t_star
+        t = torch.where(t_logit > t_star, t_uniform, t_logit)
+
+        if self.train_shift is not None:
+            return self._shift_t(t, self.train_shift)
+        return t
 
     def sample_t(self, n: int, device=None):
         if self.t_sampling_method == 'uniform':
@@ -90,22 +105,6 @@ class Denoiser(nn.Module):
             return self._shift_t(t, self.train_shift)
         return t
 
-    def sample_t_plateau_logit_normal(self, n: int, device=None):
-        """Plateau-logit-normal, uniform plateau [mode, 1-eps]."""
-        noise = torch.randn(n, device=device)
-        t_gaussian = noise * self.P_std + self.P_mean
-        eps = 1e-3
-
-        t_logit = torch.sigmoid(t_gaussian)
-        t_star = torch.sigmoid(torch.tensor(self.P_mean, device=device))
-
-        t_uniform = torch.rand(n, device=device) * (1.0 - eps - t_star) + t_star
-        t = torch.where(t_logit > t_star, t_uniform, t_logit)
-
-        if self.train_shift is not None:
-            return self._shift_t(t, self.train_shift)
-        return t
-
     def forward(self, x, z, mask, labels):
         B, N, D = x.shape
         x = x.reshape(B*N, -1).repeat(self.diffusion_batch_mul, 1)
@@ -121,20 +120,20 @@ class Denoiser(nn.Module):
         t = self.sample_t(x.size(0), device=x.device).view(-1, *([1] * (x.ndim - 1)))
         e = torch.randn_like(x) * self.noise_scale
 
-        xt = t * x + (1 - t) * e
-        v = (x - xt) / (1 - t).clamp_min(t_eps)
+        xt = (1 - t) * x + t * e
+        v = (xt - x) / t.clamp_min(t_eps)
 
         pred = self.denoising_net(xt, z, t.flatten())
 
         if self.pred_type == 'x':
-            v_pred = (pred - xt) / (1 - t).clamp_min(t_eps)
+            v_pred = (xt - pred) / t.clamp_min(t_eps)
             x_pred = pred
         elif self.pred_type == 'v':
             v_pred = pred
-            x_pred = xt + (1-t).clamp_min(t_eps) * pred
+            x_pred = xt - t.clamp_min(t_eps) * pred
         elif self.pred_type == 'e':
-            v_pred = (xt-pred)/(t).clamp_min(t_eps)
-            x_pred = (xt-(1-t) * pred) / t.clamp_min(t_eps)
+            v_pred = (pred - xt) / (1 - t).clamp_min(t_eps)
+            x_pred = (xt - t * pred) / (1 - t).clamp_min(t_eps)
 
         loss = (v - v_pred) ** 2
 
@@ -174,7 +173,7 @@ class Denoiser(nn.Module):
     def generate(self, xt, z, labels, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
         device = z.device
         bsz = xt.size(0)
-        timesteps = torch.linspace(self.t_eps_sample, 1.0 - self.t_eps_sample, self.steps+1, device=device)
+        timesteps = torch.linspace(1.0 - self.t_eps_sample, self.t_eps_sample, self.steps+1, device=device)
         if self.sample_shift is not None:
             timesteps = self._shift_t(timesteps, self.sample_shift)
 
@@ -199,9 +198,9 @@ class Denoiser(nn.Module):
         if self.pred_type == 'v':
             return pred
         elif self.pred_type == 'x':
-            return (pred - xt) / (1.0 - t).clamp_min(self.t_eps)
+            return (xt - pred) / t.clamp_min(self.t_eps)
         elif self.pred_type == 'e':
-            return (xt - pred) / (t).clamp_min(self.t_eps)
+            return (pred - xt) / (1.0 - t).clamp_min(self.t_eps)
 
     @torch.no_grad()
     def _forward_sample(self, xt, z, t, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):

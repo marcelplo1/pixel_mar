@@ -9,8 +9,8 @@ model:
     t_eps: 5.0e-2
     sample_t_mean: 0.0
     sample_t_std: 1.0
-    train_shift: 10.0
-    sample_shift: 10.0
+    train_shift: 6.93
+    sample_shift: 6.93
     t_sampling_method: 'logit_normal'
     diffusion_batch_mul: 1
     pred_type: 'x'
@@ -28,19 +28,22 @@ model:
     decoder_depth: 12
     decoder_num_heads: 12
     mlp_ratio: 4.0
-    dropout: 0.0
-    buffer_size: 64
-    gt_noise_scale: 0.0
-    min_mask_rate: 0.7
+    dropout: 0.1
+    class_token_size: 64
+    mask_rate_token_size: 8
+    train_mask_schedule: 'exp'
+    mask_condition: False
+    min_s: 0.2
   denoiser_params:
-    hidden_dim: 768
+    hidden_dim: 1024
     depth: 6
     dropout: 0.0
 
 sampler:
-  method: 'heun'
-  num_generation_passes: 1
+  method: 'euler'
   t_eps_sample: 1.0e-4
-  num_ar_steps: 64
+  mask_schedule: 'cosine'
+  order_strategy: random
+  num_ar_steps: 32
   num_timesteps: 50
   noise_scale: 1.0

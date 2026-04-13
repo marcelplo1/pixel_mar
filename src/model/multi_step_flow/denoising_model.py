@@ -12,7 +12,13 @@ class ResBlock(nn.Module):
         super().__init__()
         self.norm = RMSNorm(hidden_dim, eps=1e-6)
         mlp_hidden_dim = int(hidden_dim * mlp_ratio)
+        #mlp_hidden_dim = hidden_dim
         self.mlp = SwiGLUFFN(hidden_dim, mlp_hidden_dim, drop=proj_drop)
+        # self.mlp = nn.Sequential(
+        #     nn.Linear(hidden_dim, hidden_dim),
+        #     nn.SiLU(),
+        #     nn.Linear(hidden_dim, hidden_dim),
+        # )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_dim, 3 * hidden_dim, bias=True)
@@ -127,6 +133,8 @@ class DenoisingModel(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.z_proj = nn.Linear(z_hidden_dim, hidden_dim)
 
+        self.fusion_emb = nn.Linear(2 * hidden_dim, hidden_dim)
+
         if denoiser_type == 'ada_ln':
             self.blocks = nn.ModuleList([
                 ResBlock(hidden_dim)
@@ -141,50 +149,6 @@ class DenoisingModel(nn.Module):
             ])
             self.final_layer = nn.Linear(hidden_dim, self.embedding_dim, bias=True)
             self.initialize_weights_in_context()
-        elif denoiser_type == 'attn':
-            self.blocks = nn.ModuleList([
-                AttenBlock(hidden_dim, hidden_dim // 64)
-                for i in range(depth)
-            ])
-            self.final_layer = FinalLayer(hidden_dim, self.embedding_dim)
-            self.initialize__attn_weights()
-        elif denoiser_type == 'add':
-            self.blocks = nn.ModuleList([
-                AttenBlock(hidden_dim, hidden_dim // 64)
-                for i in range(depth)
-            ])
-            self.final_layer = FinalLayer(hidden_dim, self.embedding_dim)
-            self.initialize__attn_weights()
-        
-    def initialize__attn_weights(self):
-        # Initialize transformer layers:
-        def _basic_init(module):
-            if isinstance(module, nn.Linear):
-                torch.nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0)
-        self.apply(_basic_init)
-
-        # Specific normal initialization for projections and embedders
-        if self.x_proj is not None:
-            nn.init.normal_(self.x_proj.weight, std=0.02)
-        nn.init.normal_(self.z_proj.weight, std=0.02)
-
-        # Timestep MLP initialization (standard in diffusion models)
-        nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
-        nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
-
-        # Zero-out adaLN modulation layers:
-        for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
-
-        # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
-
-        nn.init.constant_(self.final_layer.linear.weight, 0)
-        nn.init.constant_(self.final_layer.linear.bias, 0)
 
     def initialize_weights_in_context(self):
         # Basic Xavier initialization for all Linear layers
@@ -231,6 +195,7 @@ class DenoisingModel(nn.Module):
         if self.x_proj is not None:
             nn.init.normal_(self.x_proj.weight, std=0.02)
         nn.init.normal_(self.z_proj.weight, std=0.02)
+        nn.init.normal_(self.fusion_emb.weight, std=0.02)
 
         # Timestep MLP initialization (standard in diffusion models)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
@@ -281,29 +246,6 @@ class DenoisingModel(nn.Module):
 
         return x
     
-    def forward_attn(self, x, z, t):
-        """
-        x: (B*N, D)
-        z: (B*N, D')
-        y: (B*N, Cls_num)
-        t: (B*N, 1)
-        """
-        x = self._proj_x(x)
-        t = self.t_embedder(t)
-        z = self.z_proj(z)
-
-        c = t + z
-
-        x = x.unsqueeze(1)
-
-        for block in self.blocks:
-            x = block(x, c)
-
-        x = x[:, 0, :]
-        x = self.final_layer(x, c)
-
-        return x
-    
     def forward_ada_ln(self, x, z, t):
         """
         x: (B*N, D)
@@ -314,6 +256,9 @@ class DenoisingModel(nn.Module):
         t = self.t_embedder(t)
         z = self.z_proj(z)
         c = t + z
+        #c = t
+
+        x = self.fusion_emb(torch.cat((x, z), dim=-1))
 
         for block in self.blocks:
             x = block(x, c)
@@ -321,37 +266,11 @@ class DenoisingModel(nn.Module):
         x = self.final_layer(x, c)
         return x
 
-    def forward_add(self, x, z, t):
-        """
-        x: (B*N, D)
-        z: (B*N, D')
-        t: (B*N, 1)
-        """
-        x = self._proj_x(x)
-        t = self.t_embedder(t)
-        z = self.z_proj(z)
-
-        c = t  # adaLN condition is timestep only
-        x = x.unsqueeze(1)
-        z = z.unsqueeze(1)
-
-        for block in self.blocks:
-            x = block(x + z, c)
-
-        x = x[:, 0, :]
-        x = self.final_layer(x, c)
-
-        return x
-
     def forward(self, x, z, t):
         if self.denoiser_type == 'ada_ln':
             x = self.forward_ada_ln(x, z, t)
         elif self.denoiser_type == 'in_context':
             x = self.forward_in_context(x, z, t)
-        elif self.denoiser_type == 'attn':
-            x = self.forward_attn(x, z, t)
-        elif self.denoiser_type == 'add':
-            x = self.forward_add(x, z, t)
         else:
             raise NotImplementedError
         return x

@@ -31,7 +31,7 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
-    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context", "cross_attn", "attn", "add"])
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context"])
     parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
     parser.add_argument("--use_latent_space", action="store_true", help="Operate denoiser in DINOv2 latent space instead of pixel space")
 
@@ -39,7 +39,10 @@ def create_parser():
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
     parser.add_argument("--epochs", type=int, default=1000, help="Training epochs")
     parser.add_argument("--warmup_epochs", type=int, default=100, help="Number of warmup epochs")
-    parser.add_argument("--lr", type=float, default=2e-4, help="Learning rate")
+    parser.add_argument("--lr", type=float, default=None, help="Learning rate (absolute lr)")
+    parser.add_argument("--blr", type=float, default=1e-4, help="Base learning rate: absolute_lr = base_lr * total_batch_size / 256")
+    parser.add_argument("--min_lr", type=float, default=0.0, help="Lower lr bound for cyclic schedulers that hit 0")
+    parser.add_argument("--lr_schedule", type=str, default="constant", choices=["constant", "cosine"], help="Learning rate schedule after warmup")
     parser.add_argument('--weight_decay', default=0.02, type=float, help='Weight decay for the optimizer')
     parser.add_argument("--save_freq", type=int, default=5, help="Frequency of saving the checkpoint")
     parser.add_argument("--label_drop_prob", type=float, default=0.1, help="Learning rate")
@@ -55,7 +58,7 @@ def create_parser():
     parser.add_argument("--online_eval_freq", type=int, default=25, help="Frequency of online evaluation during training")
     parser.add_argument("--remove_ema", action="store_true", help="Use exponential moving average for the model parameters")
     parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-free guidance scale (1.0 = no guidance)")
-    parser.add_argument("--cfg_interval_min", type=float, default=0.1, help="CFG interval lower bound (denoiser timestep)")
+    parser.add_argument("--cfg_interval_min", type=float, default=0.0, help="CFG interval lower bound (denoiser timestep)")
     parser.add_argument("--cfg_interval_max", type=float, default=1.0, help="CFG interval upper bound (denoiser timestep)")
     parser.add_argument("--ema_eval_decay", type=float, default=None, help="EMA decay value to use for evaluation (must match one of ema_decays in config)")
 
@@ -224,18 +227,23 @@ def main():
         decoder_num_heads=ar_params.get('decoder_num_heads', 12),
         mlp_ratio=ar_params.get('mlp_ratio', 4.0),
         dropout=ar_params.get('dropout', 0.1),
-        buffer_size=ar_params.get('buffer_size', 64),
+        class_token_size=ar_params.get('class_token_size', 64),
+        mask_rate_token_size=ar_params.get('mask_rate_token_size', 8),
         min_mask_rate=ar_params.get('min_mask_rate', 0.7),
+        
+        train_mask_schedule=ar_params.get('train_mask_schedule', 'truncnorm'),
         gt_noise_scale=ar_params.get('gt_noise_scale', 0.0),
         num_classes=args.class_num,
         lable_dropout=args.label_drop_prob,
         latent_dim=rae_params.get('latent_dim', None) if rae_params else None,
+        mask_condition=ar_params.get('mask_condition', False),
     )
     if ar_type == 'encoder_decoder':
         ar_model = ArEncoderDecoder(
             **ar_common_kwargs,
             encoder_dim=ar_params.get('encoder_dim', 768),
             encoder_depth=ar_params.get('encoder_depth', 12),
+            encoder_num_heads=ar_params.get('encoder_num_heads', 12),
         ).to(device)
     elif ar_type == 'decoder':
         ar_model = ArDecoder(
@@ -297,7 +305,16 @@ def main():
     ar_model_single = ar_model.module
     denoiser_single = denoiser.module
     
+    # Scale learning rate based on effective batch size (linear scaling rule)
+    eff_batch_size = args.batch_size * world_size
+    if args.lr is None:  # only base_lr is specified
+        args.lr = args.blr * eff_batch_size / 256
+    print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
+    print("actual lr: %.2e" % args.lr)
+    print("effective batch size: %d" % eff_batch_size)
+
     opt_params = list(ar_model.parameters()) + list(denoiser.parameters())
+
     optimizer = optim.AdamW(
         opt_params,
         lr=args.lr,
