@@ -29,7 +29,7 @@ def create_parser():
     parser = argparse.ArgumentParser(description="Argument Parser for toy example")
     parser.add_argument("--config", type=str, default="./configs/ImageNet64/pixelMAR_base_64.yaml", help="Specify the config")
     parser.add_argument("--use_logging", action="store_true", help="Enable debug mode")
-    parser.add_argument("--output_dir", type=str, default="./output/debug", help="Directory to save outputs")
+    parser.add_argument("--output_dir", type=str, default="./output", help="Directory to save outputs")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
@@ -95,8 +95,6 @@ def main():
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     global_rank = dist.get_rank() if dist.is_initialized() else 0
 
-    os.makedirs(args.output_dir, exist_ok=True)
-
     model_config, sampler_config = parse_configs(args.config)
     model_params = model_config.get('params', None)
     ar_params = model_config.get('ar_params', None)
@@ -109,6 +107,20 @@ def main():
     args.patch_size = model_params.get('patch_size', 16)
     args.channels = model_params.get('channels', 3)
 
+    # The last folder of output_dir always matches the wandb run name so the
+    # two stay in sync and nothing collides when the parent dir is shared.
+    if global_rank == 0:
+        now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        exp_name = f"{model_name}_{args.img_size}px_{now}"
+    else:
+        exp_name = None
+    if dist.is_initialized():
+        obj_list = [exp_name]
+        dist.broadcast_object_list(obj_list, src=0)
+        exp_name = obj_list[0]
+    args.output_dir = os.path.join(args.output_dir, exp_name)
+    os.makedirs(args.output_dir, exist_ok=True)
+
     if global_rank == 0 and not args.evaluate:
         with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
             yaml.safe_dump(vars(args), f, sort_keys=True)
@@ -116,8 +128,6 @@ def main():
             yaml.safe_dump({"model": model_config, "sampler": sampler_config}, f, sort_keys=False)
 
     if args.use_wandb and global_rank == 0 and not args.evaluate:
-        now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        exp_name = f"{model_name}_{args.img_size}px_{now}"   
         initialize_wandb(args,
                         entity=args.wandb_entity,
                         exp_name=exp_name,
@@ -422,14 +432,15 @@ def main():
 
         calc_val_loss(args, ar_model_single, denoiser_single, dataloader_val, epoch, device, rae_tokenizer=rae_tokenizer)
 
-        #if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0 or epoch == args.epochs:
-        if int(epoch) % args.online_eval_freq == 0 or epoch == args.epochs:
+        is_last_epoch = (epoch == args.epochs - 1)
+
+        if int(epoch) % args.online_eval_freq == 0 or is_last_epoch:
             print("Starting online evaluation...")
             evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics, rae_tokenizer=rae_tokenizer, global_step=global_step)
             print("Online evaluation finsihed")
 
         if global_rank == 0:
-            if int(epoch) % args.save_freq == 0:
+            if int(epoch) % args.save_freq == 0 or is_last_epoch:
                 print("Saving online checkpoint...")
                 #save_path = os.path.join(args.output_dir, "checkpoint_{}.pt".format(epoch))
                 ckpt_path = os.path.join(args.output_dir, "checkpoint_last.pt")

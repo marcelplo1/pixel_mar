@@ -1,5 +1,5 @@
 model:
-  name: flowMAR_B_dinov2-L_x_exp-mask
+  name: flowMAR_B_dinov2-L_x_exp_mask
   dataset_name: ImageNet_256
   params:
     img_size: 256
