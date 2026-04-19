@@ -1,6 +1,6 @@
 model:
-  name: pixelMar_base_mae_256
-  dataset_name: ImageNet
+  name: flowMAR_B_mae_x_exp-mask
+  dataset_name: ImageNet_256
   params:
     img_size: 256
     patch_size: 16
@@ -37,6 +37,7 @@ model:
   denoiser_params:
     hidden_dim: 1024
     depth: 6
+    hidden_ratio: 4.0
     dropout: 0.0
 
 sampler:

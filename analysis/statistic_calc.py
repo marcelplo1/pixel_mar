@@ -29,7 +29,7 @@ def main():
         transforms.ToTensor(), 
     ])
     
-    dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
+    dataset = datasets.ImageFolder(os.path.join(args.data_path, 'eval'), transform=transform)
 
     if args.single_class:
         targets = torch.tensor(dataset.targets)

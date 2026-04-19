@@ -1,5 +1,6 @@
 from collections import defaultdict
 
+import json
 import os
 import random
 import shutil
@@ -40,10 +41,8 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         if use_latent and rae_tokenizer is not None:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 x_gt = rae_tokenizer.encode(samples)
-            ar_model_input = x_gt  # AR model takes RAE tokens
         else:
             x_gt = patchify(samples, args.patch_size)
-            ar_model_input = samples  # AR model takes images (has bottlneck patche-embedder)
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
 
         if timer:
@@ -52,7 +51,7 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         recon_weight = getattr(args, 'recon_weight', 0.0)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            z, mask, x_recon = ar_model(ar_model_input, orders, labels)
+            z, mask, x_recon = ar_model(x_gt, orders, labels)
 
         if timer:
             timer.mark('ar_model_end')
@@ -102,6 +101,12 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
             if recon_loss is not None:
                 stats["train/recon_loss"] = recon_loss.item()
 
+            # Extra losses for MeanFlow objective
+            denoiser_inner = denoiser_single if hasattr(denoiser_single, 'last_loss_u_raw') else None
+            if denoiser_inner is not None:
+                stats["train/loss_u_raw"] = denoiser_inner.last_loss_u_raw.item()
+                stats["train/loss_v_raw"] = denoiser_inner.last_loss_v_raw.item()
+
             if args.use_wandb:
                 log(stats, step=optimizer_step)
 
@@ -126,15 +131,13 @@ def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_t
         if use_latent and rae_tokenizer is not None:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 x_gt = rae_tokenizer.encode(samples)
-            ar_model_input = x_gt
         else:
             x_gt = patchify(samples, args.patch_size)
-            ar_model_input = samples
 
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            z, mask, x_recon = ar_model(ar_model_input, orders, labels)
+            z, mask, x_recon = ar_model(x_gt, orders, labels)
             denoiser_loss = denoiser(x_gt, z, mask, labels)
 
         losses.append(denoiser_loss.item())
@@ -156,19 +159,20 @@ def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_t
 
     torch.distributed.barrier()
 
-def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epoch=None, metrics=None, rae_tokenizer=None):
+def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epoch=None, metrics=None, rae_tokenizer=None, global_step=None):
     ar_model.eval()
     denoiser.eval()
 
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
+    images_dir = os.path.join(args.output_dir, "images")
     if epoch is not None:
-        save_folder_fid = os.path.join(args.output_dir, "train_fid_samples")
-        class_folder = os.path.join(args.output_dir, "train_class_samples", 'epoch{}'.format(epoch))
+        save_folder_fid = os.path.join(images_dir, "train_fid_samples")
+        class_folder = os.path.join(images_dir, "train_class_samples", 'epoch{}'.format(epoch))
     else:
-        save_folder_fid = os.path.join(args.output_dir, "eval_fid_samples")
-        class_folder = os.path.join(args.output_dir, "eval_class_samples")
+        save_folder_fid = os.path.join(images_dir, "eval_fid_samples")
+        class_folder = os.path.join(images_dir, "eval_class_samples")
 
     if local_rank == 0: 
         os.makedirs(class_folder, exist_ok=True)
@@ -304,6 +308,7 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
                 metrics['recall'].append(recall)
         
         if local_rank == 0:
+            # Log Wandb
             if args.use_wandb and epoch is not None:
                 stats = {
                     "evaluate/fid": fid_score,
@@ -311,6 +316,19 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
                     "epoch" : epoch
                 }
                 log(stats)
+            # Log Jsonl files
+            if epoch is not None:
+                metrics_file = os.path.join(args.output_dir, "eval.jsonl")
+                row = {"epoch": epoch}
+                if global_step is not None:
+                    row["step"] = int(global_step)
+                if fid:
+                    row["fid"] = float(fid_score)
+                if isc:
+                    row["is"] = float(inception_score)
+
+                with open(metrics_file, "a") as f:
+                    f.write(json.dumps(row) + "\n")
             shutil.rmtree(save_folder_fid)
 
     torch.distributed.barrier()

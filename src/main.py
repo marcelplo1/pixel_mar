@@ -2,6 +2,7 @@ import argparse
 import datetime
 import os
 import numpy as np
+import yaml
 from model.ar_encoder_decoder import ArEncoderDecoder
 import torch
 import torch.nn as nn
@@ -13,6 +14,8 @@ import copy
 
 from model.multi_step_flow.denoiser import Denoiser
 from model.multi_step_flow.denoising_model import DenoisingModel
+from model.one_step_flow.mean_flow import MeanFlow
+from model.one_step_flow.mean_flow_model import MeanFlowModel
 from model.ar_decoder import ArDecoder
 from utils import ddp
 from utils.configs_utils import parse_configs
@@ -31,7 +34,7 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
-    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "in_context"])
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "ada_ln_fusion"])
     parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
     parser.add_argument("--use_latent_space", action="store_true", help="Operate denoiser in DINOv2 latent space instead of pixel space")
 
@@ -106,9 +109,15 @@ def main():
     args.patch_size = model_params.get('patch_size', 16)
     args.channels = model_params.get('channels', 3)
 
+    if global_rank == 0 and not args.evaluate:
+        with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
+            yaml.safe_dump(vars(args), f, sort_keys=True)
+        with open(os.path.join(args.output_dir, "config.yaml"), "w") as f:
+            yaml.safe_dump({"model": model_config, "sampler": sampler_config}, f, sort_keys=False)
+
     if args.use_wandb and global_rank == 0 and not args.evaluate:
         now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        exp_name = f"{model_name}_{dataset_name}_{args.img_size}px_{now}"   
+        exp_name = f"{model_name}_{args.img_size}px_{now}"   
         initialize_wandb(args,
                         entity=args.wandb_entity,
                         exp_name=exp_name,
@@ -246,51 +255,82 @@ def main():
             encoder_num_heads=ar_params.get('encoder_num_heads', 12),
         ).to(device)
     elif ar_type == 'decoder':
-        ar_model = ArDecoder(
-            **ar_common_kwargs,
-            bottleneck_dim=model_params.get('bottleneck_dim', None),
-        ).to(device)
+        ar_model = ArDecoder(**ar_common_kwargs).to(device)
     else:
         raise ValueError(f"Unknown ar_type: '{ar_type}'.")
 
-    # Load denoising model from config file
-    denoising_model = DenoisingModel(
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        channels=args.channels,
-        hidden_dim=denoiser_params.get('hidden_dim', 1024),
-        depth=denoiser_params.get('depth', 6),
-        dropout=denoiser_params.get('dropout', 0.1),
-        z_hidden_dim=ar_params.get('decoder_dim', 768),
-        num_classes=args.class_num,
-        denoiser_type=args.denoiser_type,
-        bottleneck_dim=model_params.get('bottleneck_dim', None),
-        latent_dim=latent_dim
-    )
-    #Load denoiser from config file
-    denoiser = Denoiser(
-        denoising_model=denoising_model,
-        output_dir=args.output_dir,
-        sampling_method=sampler_config.get('method', 'euler'),
-        pred_type=model_params.get('pred_type', 'v'),
-        diffusion_batch_mul=model_params.get('diffusion_batch_mul', 1),
-        num_timesteps=sampler_config.get('num_timesteps', 100),
-        sample_t_mean=model_params.get('sample_t_mean', 0.0),
-        sample_t_std=model_params.get('sample_t_std', 1.0),
-        t_eps=model_params.get('t_eps', 1e-2),
-        t_eps_sample=sampler_config.get('t_eps_sample', 1e-2),
-        noise_scale=sampler_config.get('noise_scale', 1.0),
-        ema_decay=ema_decay,
-        use_logging=args.use_logging,
-        train_shift=model_params.get('train_shift', None),
-        sample_shift=model_params.get('sample_shift', None),
-        t_sampling_method=model_params.get('t_sampling_method', 'logit_normal')
-    ).to(device)
-
-    # Share bottleneck embedding between AR-model and denoiser (just used in pixelspace)
-    bottleneck_dim = model_params.get('bottleneck_dim', None)
-    if bottleneck_dim is not None:
-        object.__setattr__(denoising_model, 'shared_x_proj', ar_model.x_proj)
+    flow_type = model_params.get('flow_type', 'multi_step')
+    if flow_type == 'multi_step':
+        # Load denoising model from config file
+        denoising_model = DenoisingModel(
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+            channels=args.channels,
+            hidden_dim=denoiser_params.get('hidden_dim', 1024),
+            depth=denoiser_params.get('depth', 6),
+            hidden_ratio=denoiser_params.get('hidden_ratio', 4.0),
+            dropout=denoiser_params.get('dropout', 0.1),
+            z_hidden_dim=ar_params.get('decoder_dim', 768),
+            num_classes=args.class_num,
+            denoiser_type=args.denoiser_type,
+            bottleneck_dim=model_params.get('bottleneck_dim', None),
+            latent_dim=latent_dim
+        )
+        #Load denoiser from config file
+        denoiser = Denoiser(
+            denoising_model=denoising_model,
+            output_dir=args.output_dir,
+            sampling_method=sampler_config.get('method', 'euler'),
+            pred_type=model_params.get('pred_type', 'v'),
+            diffusion_batch_mul=model_params.get('diffusion_batch_mul', 1),
+            num_timesteps=sampler_config.get('num_timesteps', 100),
+            sample_t_mean=model_params.get('sample_t_mean', 0.0),
+            sample_t_std=model_params.get('sample_t_std', 1.0),
+            t_eps=model_params.get('t_eps', 1e-2),
+            t_eps_sample=sampler_config.get('t_eps_sample', 1e-2),
+            noise_scale=sampler_config.get('noise_scale', 1.0),
+            ema_decay=ema_decay,
+            use_logging=args.use_logging,
+            train_shift=model_params.get('train_shift', None),
+            sample_shift=model_params.get('sample_shift', None),
+            t_sampling_method=model_params.get('t_sampling_method', 'logit_normal')
+        ).to(device)
+    elif flow_type == 'one_step':
+        denoising_model = MeanFlowModel(
+            img_size=args.img_size,
+            patch_size=args.patch_size,
+            channels=args.channels,
+            hidden_dim=denoiser_params.get('hidden_dim', 1024),
+            depth=denoiser_params.get('depth', 6),
+            aux_head_depth=denoiser_params.get('aux_head_depth', 2),
+            hidden_ratio=denoiser_params.get('hidden_ratio', 4.0),
+            dropout=denoiser_params.get('dropout', 0.0),
+            z_hidden_dim=ar_params.get('decoder_dim', 768),
+            bottleneck_dim=model_params.get('bottleneck_dim', None),
+            latent_dim=latent_dim,
+            pred_type=model_params.get('pred_type', 'x'),
+            t_eps=model_params.get('t_eps', 5e-2),
+        )
+        denoiser = MeanFlow(
+            denoising_model=denoising_model,
+            output_dir=args.output_dir,
+            sampling_method=sampler_config.get('method', 'euler'),
+            diffusion_batch_mul=model_params.get('diffusion_batch_mul', 1),
+            num_timesteps=sampler_config.get('num_timesteps', 1),
+            sample_t_mean=model_params.get('sample_t_mean', 0.0),
+            sample_t_std=model_params.get('sample_t_std', 1.0),
+            t_eps=model_params.get('t_eps', 5e-2),
+            t_eps_sample=sampler_config.get('t_eps_sample', 1e-5),
+            noise_scale=sampler_config.get('noise_scale', 1.0),
+            ema_decay=ema_decay,
+            use_logging=args.use_logging,
+            train_shift=model_params.get('train_shift', None),
+            sample_shift=model_params.get('sample_shift', None),
+            data_proportion=model_params.get('data_proportion', 0.5),
+            norm_p=model_params.get('norm_p', 1.0),
+            norm_eps=model_params.get('norm_eps', 1e-2),
+            t_sampling_method=model_params.get('t_sampling_method', 'logit_normal'),
+        ).to(device)
 
     if args.use_latent_space:
         denoiser_single = denoiser if not hasattr(denoiser, 'module') else denoiser.module
@@ -385,7 +425,7 @@ def main():
         #if int(epoch) % args.online_eval_freq == 0 and int(epoch) > 0 or epoch == args.epochs:
         if int(epoch) % args.online_eval_freq == 0 or epoch == args.epochs:
             print("Starting online evaluation...")
-            evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics, rae_tokenizer=rae_tokenizer)
+            evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics, rae_tokenizer=rae_tokenizer, global_step=global_step)
             print("Online evaluation finsihed")
 
         if global_rank == 0:
@@ -413,6 +453,12 @@ def main():
                 tmp_path = ckpt_path + ".tmp"
                 torch.save(checkpoint, tmp_path)
                 os.replace(tmp_path, ckpt_path)
+
+                if int(epoch) % 100 == 0 and int(epoch) > 0:
+                    archive_path = os.path.join(args.output_dir, f"checkpoint_epoch{int(epoch)}.pt")
+                    torch.save(checkpoint, archive_path)
+                    print(f"Archived checkpoint to {archive_path}")
+
                 print("Saving online checkpoint finished")
 
 if __name__ == "__main__":

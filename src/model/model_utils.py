@@ -108,57 +108,44 @@ class Attention(nn.Module):
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-    
 
-class CrossAttention(nn.Module):
-    """Cross-attention: Q from x, KV from conditioning tokens."""
-    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0., force_float=False):
+
+class AttentionRoPE(nn.Module):
+    def __init__(self, dim, num_heads=8, qkv_bias=True, qk_norm=True, attn_drop=0., proj_drop=0.):
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
+        head_dim = dim // num_heads
 
-        self.q_norm = RMSNorm(self.head_dim) if qk_norm else nn.Identity()
-        self.k_norm = RMSNorm(self.head_dim) if qk_norm else nn.Identity()
+        self.q_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
+        self.k_norm = RMSNorm(head_dim) if qk_norm else nn.Identity()
 
-        self.q_proj = nn.Linear(dim, dim, bias=qkv_bias)
-        self.kv_proj = nn.Linear(dim, dim * 2, bias=qkv_bias)
-        self.attn_drop = nn.Dropout(attn_drop)
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.attn_drop_p = attn_drop
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-        self.force_float = force_float
-
-    def forward(self, x, cond):
-        """
-        x: (B, D) — query source
-        cond: (B, S, D) — key/value source (e.g. [t_emb, z_emb] stacked)
-        """
-        B, D = x.shape
-        S = cond.shape[1]
-
-        q = self.q_proj(x).reshape(B, 1, self.num_heads, self.head_dim).permute(0, 2, 1, 3)  # (B, H, 1, hd)
-        kv = self.kv_proj(cond).reshape(B, S, 2, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
-        k, v = kv[0], kv[1]  # (B, H, S, hd)
+    def forward(self, x, rope=None):
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
 
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-        scale = 1.0 / math.sqrt(self.head_dim)
-        if self.force_float:
-            with torch.cuda.amp.autocast(enabled=False):
-                attn = (q.float() @ k.float().transpose(-2, -1)) * scale
-        else:
-            attn = (q @ k.transpose(-2, -1)) * scale
+        if rope is not None:
+            q = rope(q)
+            k = rope(k)
 
-        attn = attn.softmax(dim=-1)
-        attn = F.dropout(attn, p=self.attn_drop.p if self.training else 0., training=self.training)
-        x = attn @ v
+        x = F.scaled_dot_product_attention(
+            q, k, v,
+            dropout_p=self.attn_drop_p if self.training else 0.0
+        )
 
-        x = x.reshape(B, D)
+        x = x.transpose(1, 2).reshape(B, N, C)
+
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
-
 
 class SwiGLUFFN(nn.Module):
     def __init__(

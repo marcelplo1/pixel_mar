@@ -4,37 +4,15 @@ from scipy import stats
 import torch
 import torch.nn as nn
 
-from model.model_utils import Attention, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
+from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
 from utils.utils import patchify
 
-
-class BottleneckPatchEmbed(nn.Module):
-    """ Image to Patch Embedding from JiT
-    """
-    def __init__(self, img_size=256, patch_size=16, in_chans=3, pca_dim=768, embed_dim=768, bias=True):
-        super().__init__()
-        img_size = (img_size, img_size)
-        patch_size = (patch_size, patch_size)
-        num_patches = (img_size[1] // patch_size[1]) * (img_size[0] // patch_size[0])
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.num_patches = num_patches
-
-        self.proj1 = nn.Conv2d(in_chans, pca_dim, kernel_size=patch_size, stride=patch_size, bias=False)
-        self.proj2 = nn.Conv2d(pca_dim, embed_dim, kernel_size=1, stride=1, bias=bias)
-
-    def forward(self, x):
-        B, C, H, W = x.shape
-        assert H == self.img_size[0] and W == self.img_size[1], \
-            f"Input image size ({H}*{W}) doesn't match model ({self.img_size[0]}*{self.img_size[1]})."
-        x = self.proj2(self.proj1(x)).flatten(2).transpose(1, 2)
-        return x
 
 class Block(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
+        self.attn = AttentionRoPE(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                               attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -67,7 +45,6 @@ class ArDecoder(nn.Module):
             min_mask_rate = 0.7,
             min_s = 0.0,
             lable_dropout = 0.1,
-            bottleneck_dim = None,
             latent_dim = None,
             gt_noise_scale = 0.0,
             mask_condition = None,
@@ -93,13 +70,7 @@ class ArDecoder(nn.Module):
         self.mask_rate_token_size = mask_rate_token_size if mask_condition else 0
         self.total_c_token_size = class_token_size + self.mask_rate_token_size
         
-        if latent_dim is None:
-            # Pixel mode
-            pca_dim = bottleneck_dim if bottleneck_dim is not None else self.embed_dim
-            self.x_proj = BottleneckPatchEmbed(img_size, patch_size, channels, pca_dim, decoder_dim, bias=True)
-        else:
-            # Latent mode
-            self.x_proj = nn.Linear(self.embed_dim, decoder_dim, bias=True)
+        self.x_proj = nn.Linear(self.embed_dim, decoder_dim, bias=True)
 
         self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
         self.class_emb = nn.Embedding(num_classes, decoder_dim)
@@ -163,14 +134,6 @@ class ArDecoder(nn.Module):
         if self.mask_rate_emb is not None:
             nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)
             nn.init.normal_(self.mask_rate_emb.mlp[2].weight, std=0.02)
-
-        # Initialize patch_embed for pixelspace:
-        if isinstance(self.x_proj, BottleneckPatchEmbed):
-            w1 = self.x_proj.proj1.weight.data
-            nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
-            w2 = self.x_proj.proj2.weight.data
-            nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
-            nn.init.constant_(self.x_proj.proj2.bias, 0)
 
     def forward(self, x, mask_orders=None, labels=None, num_visible=None, force_unconditional=False, return_intermediates=False):
         x = self.x_proj(x)  # (B, N, decoder_dim)

@@ -56,8 +56,7 @@ class Denoiser(nn.Module):
         self.train_shift = train_shift
         self.sample_shift = sample_shift
         self.ema_params_list = None
-        self.log_counter = 0
-        self.log_batch_pred = 100
+
 
     def _shift_t(self, t, shift):
         """Apply time shift (t=0 clean, t=1 noise)."""
@@ -142,30 +141,6 @@ class Denoiser(nn.Module):
             mask = mask.view(-1, N, 1)
             loss = ((loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) * D)).mean()
 
-        self.log_counter += 1
-        if self.use_logging and dist.get_rank() == 0 and self.log_counter % self.log_batch_pred == 0:
-            self.log_counter = 0
-            time_step = round(t[0].item(), 1)
-
-            # Skip pixel-space visualization when operating in latent space
-            if self.use_latent_space == False:
-                x_vis = x.view(self.diffusion_batch_mul, B, N, D)[0]
-                x_pred_vis = x_pred.view(self.diffusion_batch_mul, B, N, D)[0].clamp(-1, 1)
-                v_pred_vis = v_pred.view(self.diffusion_batch_mul, B, N, D)[0]
-                mask_vis = mask.view(self.diffusion_batch_mul, B, N, 1)[0]
-
-                x_pred_vis[(mask_vis==0).expand_as(x_pred_vis)] = -1.0
-
-                folder = os.path.join(self.output_dir, "last_training_predictions")
-                os.makedirs(folder, exist_ok=True)
-
-                x_path =  os.path.join(folder, "ground_truth_t={}.png".format(time_step))
-                save_img_as_fig(unpatchify(x_vis, self.patch_size, self.channels),
-                                file_path=x_path, size=self.img_size)
-
-                x_pred_path = os.path.join(folder, "prediction_t={}.png".format(time_step))
-                save_img_as_fig(unpatchify(x_pred_vis, self.patch_size, self.channels),
-                                file_path=x_pred_path.format(time_step), size=self.img_size)
 
         return loss
 

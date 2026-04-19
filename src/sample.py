@@ -67,23 +67,17 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
 
     num_generation_passes = sampler_params.get('num_generation_passes', 1)
 
-    # --- Pass 0: autoregressive generation ---
     mask_schedule_type = sampler_params.get('mask_schedule', 'cosine')
     schedule = compute_mask_schedule(mask_schedule_type, num_ar_steps, seq_len)
 
     xt_global = noise_scale * torch.randn(bsz, seq_len, embed_dim, device=device)
     num_visible = 0
     for i, next_num_visible in enumerate(schedule):
-        if use_latent:
-            ar_model_input = cur_tokens
-        else:
-            ar_model_input = unpatchify(cur_tokens, patch_size, channels=channels)
-
         if cfg_scale != 1.0:
-            z_cond, mask, _ = ar_model(ar_model_input, orders, labels, num_visible)
-            z_uncond, _, _ = ar_model(ar_model_input, orders, labels, num_visible, force_unconditional=True)
+            z_cond, mask, _ = ar_model(cur_tokens, orders, labels, num_visible)
+            z_uncond, _, _ = ar_model(cur_tokens, orders, labels, num_visible, force_unconditional=True)
         else:
-            z_cond, mask, _ = ar_model(ar_model_input, orders, labels, num_visible)
+            z_cond, mask, _ = ar_model(cur_tokens, orders, labels, num_visible)
             z_uncond = None
 
         ids_to_predict = orders[:, num_visible:next_num_visible]
@@ -104,7 +98,7 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
         cur_tokens[pred_indices] = sampled_x
 
         if args.use_logging and local_rank == 0:
-            folder = os.path.join(args.output_dir, "ar_generation_steps")
+            folder = os.path.join(args.output_dir, "images", "ar_generation_steps")
             os.makedirs(folder, exist_ok=True)
             file_path = os.path.join(folder, "pass0_step_{}.png".format(i))
 

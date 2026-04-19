@@ -50,53 +50,59 @@ def log_model_parameters(ar_model, denoiser, device, args):
     print(f"\n  {'─' * 58}")
     print(f"  TOTAL: {total/1e6:.2f}M trainable")
 
-    # --- Training GFLOPs per image ---
+    # --- Training GFLOPs per image (forward + backward) ---
     try:
         from torch.utils.flop_counter import FlopCounterMode
 
         N = (args.img_size // args.patch_size) ** 2
-        D = args.channels * args.patch_size ** 2
         dnet = denoiser.denoising_net
         diff_mul = denoiser.diffusion_batch_mul
 
-        was_training = ar_model.training
-        ar_model.eval()
-        denoiser.eval()
+        was_training = (ar_model.training, denoiser.training)
+        ar_model.train()
+        denoiser.train()
 
-        with torch.no_grad(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             dummy_orders = torch.randperm(N, device=device).unsqueeze(0)
             dummy_labels = torch.zeros(1, dtype=torch.long, device=device)
 
-            # Decoder-only AR in latent space expects (B, N, latent_dim), not an image
             latent_dim = getattr(ar_model, 'latent_dim', None)
-            if latent_dim is not None:
-                dummy_ar_model_input = torch.randn(1, N, latent_dim, device=device)
-            else:
-                dummy_ar_model_input = torch.randn(1, args.channels, args.img_size, args.img_size, device=device)
+            input_dim = latent_dim if latent_dim is not None else args.channels * args.patch_size ** 2
+            dummy_ar_model_input = torch.randn(1, N, input_dim, device=device)
 
             with FlopCounterMode(display=False) as counter:
-                ar_model(dummy_ar_model_input, dummy_orders, dummy_labels, num_visible=N)
+                out = ar_model(dummy_ar_model_input, dummy_orders, dummy_labels, num_visible=N)
+                out_tensor = out[0] if isinstance(out, (tuple, list)) else out
+                out_tensor.sum().backward()
             ar_model_gflops = counter.get_total_flops() / 1e9
 
             # Denoiser processes N * diffusion_batch_mul patches per image during training
             num_patches = N * diff_mul
             D_denoiser = dnet.embedding_dim
-            dummy_xt = torch.randn(num_patches, D_denoiser, device=device)
-            dummy_z = torch.randn(num_patches, dnet.z_proj.in_features, device=device)
+            dummy_xt = torch.randn(num_patches, D_denoiser, device=device, requires_grad=True)
+            dummy_z = torch.randn(num_patches, dnet.z_proj.in_features, device=device, requires_grad=True)
             dummy_t = torch.rand(num_patches, device=device)
 
             with FlopCounterMode(display=False) as counter:
-                dnet(dummy_xt, dummy_z, dummy_t)
+                out = dnet(dummy_xt, dummy_z, dummy_t)
+                out.sum().backward()
             den_gflops = counter.get_total_flops() / 1e9
 
-        if was_training:
-            ar_model.train()
-            denoiser.train()
+        # Clear accumulated dummy grads so they don't contaminate real training
+        for p in ar_model.parameters():
+            p.grad = None
+        for p in denoiser.parameters():
+            p.grad = None
 
-        print(f"\n  Training GFLOPs per image ({N} patches, diffusion_batch_mul={diff_mul}):")
+        ar_model.train(was_training[0])
+        denoiser.train(was_training[1])
+
+        total_gflops = ar_model_gflops + den_gflops
+        print(f"\n  Training GFLOPs per image, forward+backward ({N} patches, diffusion_batch_mul={diff_mul}):")
         print(f"AR Model: {ar_model_gflops:>8.2f} GFLOPs")
         print(f"Denoiser: {den_gflops:>8.2f} GFLOPs  ({N}x{diff_mul} = {num_patches} patches)")
-        print(f"Total: {(ar_model_gflops + den_gflops):>8.2f} GFLOPs")
+        print(f"Total:    {total_gflops:>8.2f} GFLOPs/image")
+        print(f"Per step: {total_gflops * args.batch_size:>8.2f} GFLOPs  (batch_size={args.batch_size})")
     except Exception as e:
         print(f"\n  (GFLOPs computation skipped: {e})")
 

@@ -4,15 +4,14 @@ import torch
 import torch.nn as nn
 from scipy import stats
 
-from model.ar_decoder import BottleneckPatchEmbed
-from model.model_utils import Attention, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
+from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
 
 
 class Block(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, attn_drop=0.0, proj_drop=0.0):
         super().__init__()
         self.norm1 = RMSNorm(hidden_size, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
+        self.attn = AttentionRoPE(hidden_size, num_heads=num_heads, qkv_bias=True, qk_norm=True,
                               attn_drop=attn_drop, proj_drop=proj_drop)
         self.norm2 = RMSNorm(hidden_size, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -49,7 +48,6 @@ class ArEncoderDecoder(nn.Module):
             min_mask_rate=0.7,
             min_s=0.0,
             lable_dropout=0.1,
-            bottleneck_dim=None,
             latent_dim=None,
             gt_noise_scale=0.0,
             mask_condition=None,
@@ -76,13 +74,7 @@ class ArEncoderDecoder(nn.Module):
         self.total_c_token_size = class_token_size + self.mask_rate_token_size
 
         # Input projection
-        if latent_dim is None:
-            # Pixel mode
-            pca_dim = bottleneck_dim if bottleneck_dim is not None else self.embed_dim
-            self.x_proj = BottleneckPatchEmbed(img_size, patch_size, channels, pca_dim, self.encoder_dim, bias=True)
-        else:
-            # Latent mode
-            self.x_proj = nn.Linear(self.embed_dim, self.encoder_dim, bias=True)
+        self.x_proj = nn.Linear(self.embed_dim, self.encoder_dim, bias=True)
         self.x_ln = nn.LayerNorm(self.encoder_dim, eps=1e-6)
 
         self.decoder_embed = nn.Linear(self.encoder_dim, self.decoder_dim, bias=True)
@@ -167,14 +159,6 @@ class ArEncoderDecoder(nn.Module):
         if self.mask_rate_emb is not None:
             nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)
             nn.init.normal_(self.mask_rate_emb.mlp[2].weight, std=0.02)
-
-        # Initialize patch_embed for pixelspace:
-        if isinstance(self.x_proj, BottleneckPatchEmbed):
-            w1 = self.x_proj.proj1.weight.data
-            nn.init.xavier_uniform_(w1.view([w1.shape[0], -1]))
-            w2 = self.x_proj.proj2.weight.data
-            nn.init.xavier_uniform_(w2.view([w2.shape[0], -1]))
-            nn.init.constant_(self.x_proj.proj2.bias, 0)
 
     def forward_encoder(self, x, orders, num_visible, class_emb, force_unconditional=False):
         """

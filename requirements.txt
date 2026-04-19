@@ -1,6 +1,17 @@
 torch
+torchvision
 numpy
 matplotlib
-sklearn
-torchvision
-
+scikit-learn
+einops
+scipy
+opencv-python
+timm
+gdown
+transformers
+wandb
+lmdb
+Pillow
+PyYAML
+tqdm
+-e git+https://github.com/LTH14/torch-fidelity.git@master#egg=torch-fidelity
