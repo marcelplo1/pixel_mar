@@ -23,9 +23,9 @@ model:
     rae_decoder_config: './src/rae/rae_decoder_configs/ViTXL'
   ar_params:
     ar_type: 'decoder'
-    decoder_dim: 768
-    decoder_depth: 16
-    decoder_num_heads: 12
+    decoder_dim: 1024
+    decoder_depth: 24
+    decoder_num_heads: 16
     mlp_ratio: 4.0
     dropout: 0.1
     class_token_size: 64
@@ -35,7 +35,7 @@ model:
     min_s: 0.2
   denoiser_params:
     hidden_dim: 1280
-    depth: 12
+    depth: 8
     hidden_ratio: 4.0
     dropout: 0.0
     

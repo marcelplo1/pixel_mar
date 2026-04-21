@@ -1,5 +1,5 @@
 model:
-  name: flowMAR_B_vae_v_exp_mask
+  name: flowMAR_L_vae_v_exp_mask
   dataset_name: ImageNet_256
   params:
     img_size: 256
@@ -21,12 +21,12 @@ model:
     latent_scale: 0.2325
   ar_params:
     ar_type: 'encoder_decoder'
-    encoder_dim: 768
-    encoder_depth: 6
-    encoder_num_heads: 12
-    decoder_dim: 768
-    decoder_depth: 6
-    decoder_num_heads: 12
+    encoder_dim: 1024
+    encoder_depth: 12
+    encoder_num_heads: 16
+    decoder_dim: 1024
+    decoder_depth: 12
+    decoder_num_heads: 16
     mlp_ratio: 4.0
     dropout: 0.1
     class_token_size: 64
@@ -35,9 +35,9 @@ model:
     mask_condition: False
     min_s: 0.2
   denoiser_params:
-    hidden_dim: 1024
-    depth: 6
-    hidden_ratio: 4.0
+    hidden_dim: 1280
+    depth: 8
+    hidden_ratio: 1.0
     dropout: 0.0
     
 sampler:

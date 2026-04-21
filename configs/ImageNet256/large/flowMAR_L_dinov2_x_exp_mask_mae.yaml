@@ -1,5 +1,5 @@
 model:
-  name: flowMAR_L_dinov2_x_exp_mask
+  name: flowMAR_L_dinov2_x_exp_mask_mae
   dataset_name: ImageNet_256
   params:
     img_size: 256
@@ -27,7 +27,7 @@ model:
     encoder_depth: 4
     encoder_num_heads: 16
     decoder_dim: 1024
-    decoder_depth: 16
+    decoder_depth: 20
     decoder_num_heads: 16
     mlp_ratio: 4.0
     dropout: 0.1
@@ -38,7 +38,7 @@ model:
     min_s: 0.2
   denoiser_params:
     hidden_dim: 1280
-    depth: 12
+    depth: 8
     hidden_ratio: 4.0
     dropout: 0.0
     
