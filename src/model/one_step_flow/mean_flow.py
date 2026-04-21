@@ -29,7 +29,6 @@ class MeanFlow(nn.Module):
         noise_scale=1.0,
         ema_decay=0.9999,
         use_logging=False,
-        use_latent_space=False,
         train_shift=None,
         sample_shift=None,
         data_proportion=0.5,
@@ -60,7 +59,6 @@ class MeanFlow(nn.Module):
 
         self.use_logging = use_logging
         self.output_dir = output_dir
-        self.use_latent_space = use_latent_space
 
         self.train_shift = train_shift
         self.sample_shift = sample_shift

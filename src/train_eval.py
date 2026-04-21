@@ -37,8 +37,7 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        use_latent = getattr(args, 'use_latent_space', False)
-        if use_latent and rae_tokenizer is not None:
+        if rae_tokenizer is not None:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 x_gt = rae_tokenizer.encode(samples)
         else:
@@ -119,7 +118,6 @@ def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_t
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     recon_weight = getattr(args, 'recon_weight', 0.0)
-    use_latent = getattr(args, 'use_latent_space', False)
 
     losses = []
     recon_losses = []
@@ -128,7 +126,7 @@ def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_t
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if use_latent and rae_tokenizer is not None:
+        if rae_tokenizer is not None:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 x_gt = rae_tokenizer.encode(samples)
         else:

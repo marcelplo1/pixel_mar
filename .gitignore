@@ -17,6 +17,7 @@ env/
 # Ignore dataset and logging files
 data/*
 wandb/*
+rae_models/*
 
 # VSCode settings
 .vscode/

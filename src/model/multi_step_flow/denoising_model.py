@@ -11,12 +11,12 @@ class ResBlock(nn.Module):
         super().__init__()
         self.norm = RMSNorm(hidden_dim, eps=1e-6)
         mlp_hidden_dim = int(hidden_dim * hidden_ratio)
-        self.mlp = SwiGLUFFN(hidden_dim, mlp_hidden_dim, drop=proj_drop)
-        # self.mlp = nn.Sequential(
-        #     nn.Linear(hidden_dim, hidden_dim),
-        #     nn.SiLU(),
-        #     nn.Linear(hidden_dim, hidden_dim),
-        # )
+        #self.mlp = SwiGLUFFN(hidden_dim, mlp_hidden_dim, drop=proj_drop)
+        self.mlp = nn.Sequential(
+            nn.Linear(hidden_dim, mlp_hidden_dim),
+            nn.SiLU(),
+            nn.Linear(mlp_hidden_dim, hidden_dim),
+        )
         self.adaLN_modulation = nn.Sequential(
             nn.SiLU(),
             nn.Linear(hidden_dim, 3 * hidden_dim, bias=True)

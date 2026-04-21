@@ -16,10 +16,10 @@ model:
   ar_params:
     ar_type: 'encoder_decoder'
     encoder_dim: 768
-    encoder_depth: 8
+    encoder_depth: 6
     encoder_num_heads: 12
     decoder_dim: 768
-    decoder_depth: 8
+    decoder_depth: 6
     decoder_num_heads: 12
     mlp_ratio: 4.0
     dropout: 0.1

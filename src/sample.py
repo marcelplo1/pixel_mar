@@ -53,7 +53,7 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
 
     cfg_scale = getattr(args, 'cfg_scale', 1.0)
     cfg_interval = (getattr(args, 'cfg_interval_min', 0.0), getattr(args, 'cfg_interval_max', 1.0))
-    use_latent = getattr(args, 'use_latent_space', False) and rae_tokenizer is not None
+    use_latent = rae_tokenizer is not None
 
     seq_len = (img_size// patch_size) ** 2
 

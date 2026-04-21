@@ -23,7 +23,6 @@ class Denoiser(nn.Module):
         noise_scale = 1.0,
         ema_decay = 0.9999,
         use_logging=False,
-        use_latent_space=False,
         train_shift=None,
         sample_shift=None,
         t_sampling_method='logit_normal'
@@ -47,7 +46,6 @@ class Denoiser(nn.Module):
 
         self.use_logging = use_logging
         self.output_dir = output_dir
-        self.use_latent_space = use_latent_space
 
         self.pred_type = pred_type
         self.ema_decays = ema_decay if isinstance(ema_decay, list) else [ema_decay]

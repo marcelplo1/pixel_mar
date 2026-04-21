@@ -36,7 +36,6 @@ def create_parser():
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
     parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "ada_ln_fusion"])
     parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
-    parser.add_argument("--use_latent_space", action="store_true", help="Operate denoiser in DINOv2 latent space instead of pixel space")
 
     # Training
     parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
@@ -77,7 +76,7 @@ def create_parser():
     # Wandb
     parser.add_argument("--use_wandb", action="store_true", help="Use wandb for logging")
     parser.add_argument("--wandb_entity", type=str, default="tuebingen_diffusion")
-    parser.add_argument("--wandb_project", type=str, default="pixel_mar")
+    parser.add_argument("--wandb_project", type=str, default="flow_mar")
 
     return parser
 
@@ -195,7 +194,7 @@ def main():
     # RAE tokenizer for latent space mode
     rae_tokenizer = None
     latent_dim = None
-    if args.use_latent_space:
+    if rae_params is not None:
         latent_type = rae_params.get('latent_type', 'dinov2')
         if latent_type == 'dinov2':
             from rae.dinov2_tokenizer import Dinov2Tokenizer
@@ -341,10 +340,6 @@ def main():
             norm_eps=model_params.get('norm_eps', 1e-2),
             t_sampling_method=model_params.get('t_sampling_method', 'logit_normal'),
         ).to(device)
-
-    if args.use_latent_space:
-        denoiser_single = denoiser if not hasattr(denoiser, 'module') else denoiser.module
-        denoiser_single.use_latent_space = True
 
     if global_rank == 0 and args.log_parameters:
         log_model_parameters(ar_model, denoiser, device, args)
