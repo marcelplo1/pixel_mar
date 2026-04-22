@@ -40,7 +40,7 @@ model:
     min_s: 0.2
   denoiser_params:
     hidden_dim: 1280
-    depth: 6
+    depth: 10
     aux_head_depth: 2
     hidden_ratio: 4.0
     dropout: 0.0
