@@ -12,7 +12,7 @@ model:
     t_sampling_method: 'logit_normal'
     diffusion_batch_mul: 1
     pred_type: 'x'
-    bottleneck_dim: 64
+    bottleneck_dim: 128
   ar_params:
     ar_type: 'encoder_decoder'
     encoder_dim: 768
