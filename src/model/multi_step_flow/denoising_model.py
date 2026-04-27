@@ -123,8 +123,10 @@ class DenoisingModel(nn.Module):
             nn.init.normal_(self.x_proj.weight, std=0.02)
 
         # Using the fusion embedding
-        if self.denoiser_type == 'ada_ln_fusion':
+        if self.denoiser_type == 'ada_ln_fusion':                                                                                                                                               
             nn.init.normal_(self.fusion_emb.weight, std=0.02)
+            nn.init.zeros_(self.fusion_emb.weight[:, self.hidden_dim:])  # zero the z half                                                                                                         
+            nn.init.zeros_(self.fusion_emb.bias)  
 
         # Timestep MLP initialization (standard in diffusion models)
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)

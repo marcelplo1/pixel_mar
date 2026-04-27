@@ -126,8 +126,10 @@ class MeanFlowModel(nn.Module):
             nn.init.constant_(self.x_proj[1].bias, 0)
         else:
             nn.init.normal_(self.x_proj.weight, std=0.02)
-        nn.init.normal_(self.z_proj.weight, std=0.02)
+        nn.init.normal_(self.z_proj.weight, std=0.02)                                                                                                                                           
         nn.init.normal_(self.fusion_emb.weight, std=0.02)
+        nn.init.zeros_(self.fusion_emb.weight[:, self.hidden_dim:])  # zero the z half                                                                                                         
+        nn.init.zeros_(self.fusion_emb.bias)  
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
