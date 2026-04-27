@@ -128,74 +128,72 @@ class ArEncoderDecoder(nn.Module):
         )
 
     def initialize_weights(self):
+        # Match MAR: normal_(std=0.02) for all learnable embeddings/pos_embs.
+        nn.init.normal_(self.class_emb.weight, std=0.02)
+        nn.init.normal_(self.fake_latent, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.encoder_pos_emb, std=0.02)
+        nn.init.normal_(self.decoder_pos_emb, std=0.02)
+        nn.init.normal_(self.diffusion_pos_emb, std=0.02)
+
         def _init_weights(m):
             if isinstance(m, nn.Linear):
                 torch.nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.LayerNorm):
-                nn.init.constant_(m.bias, 0)
-                nn.init.constant_(m.weight, 1.0)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+                if m.weight is not None:
+                    nn.init.constant_(m.weight, 1.0)
 
         self.apply(_init_weights)
-
-        grid_size = int(self.seq_len ** 0.5)
-
-        pos_embed_grid = get_2d_sincos_pos_embed(self.encoder_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.total_c_token_size, self.encoder_dim)
-        full_pos_embed[self.total_c_token_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        self.encoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
-
-        pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.total_c_token_size, self.decoder_dim)
-        full_pos_embed[self.total_c_token_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        self.decoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
-
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
-        nn.init.trunc_normal_(self.fake_latent, std=0.02)
-        nn.init.normal_(self.diffusion_pos_emb, std=0.02)
 
         if self.mask_rate_emb is not None:
             nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)
             nn.init.normal_(self.mask_rate_emb.mlp[2].weight, std=0.02)
 
-    def forward_encoder(self, x, orders, num_visible, class_emb, force_unconditional=False):
+    def forward_encoder(self, x, mask, class_emb, force_unconditional=False):
         """
-        Encode only visible patches. Patches are reordered by orders so that
-        visible ones come first. Input `x` is already projected to (B, N, encoder_dim).
+        MAR-style encoder: prepend buffer, add pos_emb to full sequence in raster
+        order, LayerNorm, then drop masked tokens via boolean indexing.
         """
         B, N, D = x.shape
 
-        # Reorder patches by mask order (visible first)
-        x = torch.gather(x, dim=1, index=orders.unsqueeze(-1).expand(-1, -1, D))
+        # concat buffer
+        x = torch.cat(
+            [torch.zeros(B, self.total_c_token_size, D, device=x.device, dtype=x.dtype), x],
+            dim=1,
+        )
+        mask_with_buffer = torch.cat(
+            [torch.zeros(B, self.total_c_token_size, device=x.device, dtype=mask.dtype), mask],
+            dim=1,
+        )
 
-        # Class conditioning
+        # random drop class embedding during training
         if force_unconditional:
             class_embedding = self.fake_latent.expand(B, -1)
         else:
             if self.training and self.label_drop_prob > 0:
-                drop_mask = (torch.rand(B, device=x.device) < self.label_drop_prob).unsqueeze(-1).to(x.dtype)
-                class_embedding = drop_mask * self.fake_latent + (1 - drop_mask) * class_emb
+                drop_latent_mask = (torch.rand(B, device=x.device) < self.label_drop_prob).unsqueeze(-1).to(x.dtype)
+                class_embedding = drop_latent_mask * self.fake_latent + (1 - drop_latent_mask) * class_emb
             else:
                 class_embedding = class_emb
 
-        class_tokens = torch.zeros(B, self.class_token_size, self.encoder_dim, device=x.device, dtype=x.dtype)
-        class_tokens[:, :self.class_token_size] = class_embedding.unsqueeze(1)
+        x[:, :self.class_token_size] = class_embedding.unsqueeze(1)
 
         if self.mask_rate_emb is not None:
-            mask_rate = torch.tensor([1.0 - num_visible / N], device=x.device)
+            num_vis = int(N - mask[0].sum().item())
+            mask_rate = torch.tensor([1.0 - num_vis / N], device=x.device)
             mask_rate_embedding = self.mask_rate_emb(mask_rate).expand(B, -1)
-            mask_rate_tokens = mask_rate_embedding.unsqueeze(1).expand(B, self.mask_rate_token_size, -1)
-            x = torch.cat([class_tokens, mask_rate_tokens, x], dim=1)
-        else:
-            x = torch.cat([class_tokens, x], dim=1)
+            x[:, self.class_token_size:self.class_token_size + self.mask_rate_token_size] = mask_rate_embedding.unsqueeze(1)
 
+        # encoder position embedding
         x = x + self.encoder_pos_emb
         x = self.x_ln(x)
 
-        # Keep only buffer + visible tokens
-        x = x[:, :self.total_c_token_size + num_visible, :]
+        # dropping
+        x = x[(1 - mask_with_buffer).nonzero(as_tuple=True)].reshape(B, -1, D)
 
         for block in self.encoder_block:
             x = block(x)
@@ -203,24 +201,24 @@ class ArEncoderDecoder(nn.Module):
         encoded = self.encoder_norm(x)
         return encoded
 
-    def forward_decoder(self, x, ids_restore):
+    def forward_decoder(self, x, mask):
         """
-        Decode full sequence: unshuffle encoded visible tokens, insert mask tokens
-        for masked positions, then process with decoder blocks + RoPE.
+        MAR-style decoder: scatter encoded visible tokens back into their raster
+        positions, fill the rest with `mask_token`, add decoder pos_emb, run blocks.
         """
         x = self.decoder_embed(x)
+        mask_with_buffer = torch.cat(
+            [torch.zeros(x.size(0), self.total_c_token_size, device=x.device, dtype=mask.dtype), mask],
+            dim=1,
+        )
 
-        x_buffer = x[:, :self.total_c_token_size, :]
-        x_visible = x[:, self.total_c_token_size:, :]
+        # pad mask tokens
+        mask_tokens = self.mask_token.repeat(mask_with_buffer.shape[0], mask_with_buffer.shape[1], 1).to(x.dtype)
+        x_after_pad = mask_tokens.clone()
+        x_after_pad[(1 - mask_with_buffer).nonzero(as_tuple=True)] = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
 
-        num_masked = ids_restore.shape[1] - x_visible.shape[1]
-        mask_tokens = self.mask_token.repeat(x.shape[0], num_masked, 1).to(x.dtype)
-
-        x_full = torch.cat([x_visible, mask_tokens], dim=1)
-        x_full = torch.gather(x_full, dim=1, index=ids_restore.unsqueeze(-1).expand(-1, -1, x_full.shape[2]))
-        x = torch.cat([x_buffer, x_full], dim=1)
-
-        x = x + self.decoder_pos_emb
+        # decoder position embedding
+        x = x_after_pad + self.decoder_pos_emb
 
         for block in self.decoder_block:
             x = block(x, self.decoder_rope)
@@ -238,26 +236,19 @@ class ArEncoderDecoder(nn.Module):
 
         if self.training:
             mask = self.random_masking(x, self.min_mask_rate, self.min_s)
-            num_masked = int(mask[0].sum().item())
-            num_vis = N - num_masked
-            # Mask_orders from mask: visible (mask=0) first, masked (mask=1) last
-            sort_key = mask + torch.rand_like(mask)
-            mask_orders = torch.argsort(sort_key, dim=1)
-            
+            num_vis = N - int(mask[0].sum().item())
+
             # Mask-ratio-dependent noise: more noise when fewer patches are masked
             if self.gt_noise_scale > 0:
                 visible_ratio = num_vis / N
                 x = x + self.gt_noise_scale * visible_ratio * torch.randn_like(x)
-            x = self.forward_encoder(x, mask_orders, num_vis, class_embedding, force_unconditional=force_unconditional)
         else:
             num_vis = num_visible
             mask = torch.zeros(B, N, device=x.device)
             mask.scatter_(1, mask_orders[:, num_vis:].long(), 1.0)
-            x = self.forward_encoder(x, mask_orders, num_vis, class_embedding, force_unconditional=force_unconditional)
 
-        ids_restore = torch.argsort(mask_orders, dim=1)
-        z = self.forward_decoder(x, ids_restore)
-
+        x = self.forward_encoder(x, mask, class_embedding, force_unconditional=force_unconditional)
+        z = self.forward_decoder(x, mask)
         x_recon = self.reconstruction_head(z)
 
         return z, mask, x_recon

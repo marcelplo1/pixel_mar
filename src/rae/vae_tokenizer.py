@@ -39,7 +39,7 @@ class VaeTokenizer(nn.Module):
         returns: [B, N, D] where N = (H/16)*(W/16), D = 16
         """
         posterior = self.vae.encode(images)
-        z = posterior.mode()
+        z = posterior.sample()
         z = z * self.latent_scale
 
         B, D, H, W = z.shape
