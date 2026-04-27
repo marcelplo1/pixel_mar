@@ -10,12 +10,20 @@ from scipy import stats
 from torchvision import transforms
 import torch
 import numpy as np
+import wandb
 from sample import sample
 import torch_fidelity
 from utils.logging_utils import StepTimer
 from utils.wandb_utils import log
 
 from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, unpatchify
+
+
+def _module_grad_norm(parameters):
+    grads = [p.grad.detach() for p in parameters if p.grad is not None]
+    if not grads:
+        return torch.tensor(0.0)
+    return torch.norm(torch.stack([g.norm(2) for g in grads]), 2)
 
 
 def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single, denoiser_single, optimizer, device, rae_tokenizer=None):
@@ -75,6 +83,37 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         if timer:
             timer.mark('bwd_end')
 
+        optimizer_step = step + epoch * len(dataloader)
+        log_grad_details = (
+            local_rank == 0
+            and args.use_wandb
+            and args.grad_log_freq > 0
+            and optimizer_step % args.grad_log_freq == 0
+        )
+
+        ar_grad_norm = _module_grad_norm(list(ar_model.parameters()))
+        den_grad_norm = _module_grad_norm(list(denoiser.parameters()))
+
+        per_layer_norms = {}
+        grad_hist_values = None
+        if log_grad_details:
+            flat_grads = []
+            for prefix, model in (("ar_model", ar_model), ("denoiser", denoiser)):
+                for name, p in model.named_parameters():
+                    if p.grad is None:
+                        continue
+                    g = p.grad.detach()
+                    per_layer_norms[f"grad_norm_layer/{prefix}.{name}"] = g.norm(2).item()
+                    flat_grads.append(g.flatten().float().cpu())
+            if flat_grads:
+                grad_hist_values = torch.cat(flat_grads).numpy()
+
+        opt_params = list(ar_model.parameters()) + list(denoiser.parameters())
+        if args.grad_clip > 0:
+            total_grad_norm = torch.nn.utils.clip_grad_norm_(opt_params, max_norm=args.grad_clip)
+        else:
+            total_grad_norm = torch.sqrt(ar_grad_norm ** 2 + den_grad_norm ** 2)
+
         optimizer.step()
 
         if timer:
@@ -87,16 +126,22 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
             timer.mark('ema_end')
             timer.end_step()
 
-        optimizer_step = step + epoch*len(dataloader)
         if local_rank == 0:
             if timer and timer.should_log():
                 timing_stats = timer.print_and_get_stats()
-                
+
             stats = {
                 "train/loss": loss.item(),
                 "train/denoiser_loss": denoiser_loss.item(),
                 "train/lr": optimizer.param_groups[0]['lr'],
+                "train/grad_norm": total_grad_norm.item(),
+                "train/grad_norm_ar": ar_grad_norm.item(),
+                "train/grad_norm_denoiser": den_grad_norm.item(),
             }
+            if log_grad_details:
+                stats.update(per_layer_norms)
+                if grad_hist_values is not None:
+                    stats["train/grad_hist"] = wandb.Histogram(grad_hist_values)
             if recon_loss is not None:
                 stats["train/recon_loss"] = recon_loss.item()
 

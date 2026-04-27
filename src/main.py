@@ -46,6 +46,8 @@ def create_parser():
     parser.add_argument("--min_lr", type=float, default=0.0, help="Lower lr bound for cyclic schedulers that hit 0")
     parser.add_argument("--lr_schedule", type=str, default="constant", choices=["constant", "cosine"], help="Learning rate schedule after warmup")
     parser.add_argument('--weight_decay', default=0.02, type=float, help='Weight decay for the optimizer')
+    parser.add_argument("--grad_clip", type=float, default=3.0, help="Max grad norm for clip_grad_norm_ (0 disables clipping)")
+    parser.add_argument("--grad_log_freq", type=int, default=0, help="Step interval for per-layer grad norms")
     parser.add_argument("--save_freq", type=int, default=5, help="Frequency of saving the checkpoint")
     parser.add_argument("--label_drop_prob", type=float, default=0.1, help="Learning rate")
     parser.add_argument("--overfit_single_image", action="store_true", help="Train on a single image to validate the pipeline")
