@@ -115,8 +115,9 @@ class MeanFlow(nn.Module):
         r_view = r.view(-1, 1)
 
         e = torch.randn_like(x) * self.noise_scale
-        z_t = (1 - t_view) * x + t_view * e
-        v_t = (z_t - x) / t_view.clamp_min(t_eps)
+        xt = (1 - t_view) * x + t_view * e
+        vt = (xt - x) / t_view.clamp_min(t_eps)
+        #vt = e - x
 
         # Network wrapper
         def u_fn(z_t_in, t_in, r_in):
@@ -125,11 +126,11 @@ class MeanFlow(nn.Module):
         dtdt = torch.ones_like(t)
         dtdr = torch.zeros_like(r)
 
-        (u, v), (du_dt, _) = jvp(u_fn, (z_t, t, r), (v_t, dtdt, dtdr))
+        (u, v), (du_dt, _) = jvp(u_fn, (xt, t, r), (vt, dtdt, dtdr))
 
         # Compound MeanFlow target (du/dt detached because second order)
         V = u + (t_view - r_view) * du_dt.detach()
-        v_target = v_t.detach()
+        v_target = vt.detach()
 
         # Per-element squared error.
         err_u = (V - v_target) ** 2

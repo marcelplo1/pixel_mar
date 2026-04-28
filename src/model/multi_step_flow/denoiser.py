@@ -118,19 +118,18 @@ class Denoiser(nn.Module):
         e = torch.randn_like(x) * self.noise_scale
 
         xt = (1 - t) * x + t * e
-        v = (xt - x) / t.clamp_min(t_eps)
+
+        if self.pred_type == 'x':
+            v = (xt - x) / t.clamp_min(t_eps)
+        elif self.pred_type == 'v':
+            v = e - x
 
         pred = self.denoising_net(xt, z, t.flatten())
 
         if self.pred_type == 'x':
             v_pred = (xt - pred) / t.clamp_min(t_eps)
-            x_pred = pred
         elif self.pred_type == 'v':
             v_pred = pred
-            x_pred = xt - t.clamp_min(t_eps) * pred
-        elif self.pred_type == 'e':
-            v_pred = (pred - xt) / (1 - t).clamp_min(t_eps)
-            x_pred = (xt - t * pred) / (1 - t).clamp_min(t_eps)
 
         loss = (v - v_pred) ** 2
 
@@ -138,7 +137,6 @@ class Denoiser(nn.Module):
             loss = loss.view(-1, N, D)
             mask = mask.view(-1, N, 1)
             loss = ((loss * mask).sum(dim=(1, 2)) / (mask.sum(dim=(1, 2)) * D)).mean()
-
 
         return loss
 
@@ -172,8 +170,6 @@ class Denoiser(nn.Module):
             return pred
         elif self.pred_type == 'x':
             return (xt - pred) / t.clamp_min(self.t_eps)
-        elif self.pred_type == 'e':
-            return (pred - xt) / (1.0 - t).clamp_min(self.t_eps)
 
     @torch.no_grad()
     def _forward_sample(self, xt, z, t, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):

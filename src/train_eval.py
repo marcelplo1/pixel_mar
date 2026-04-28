@@ -210,19 +210,11 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
     images_dir = os.path.join(args.output_dir, "images")
-    if epoch is not None:
-        save_folder_fid = os.path.join(images_dir, "train_fid_samples")
-        class_folder = os.path.join(images_dir, "train_class_samples", 'epoch{}'.format(epoch))
-    else:
-        save_folder_fid = os.path.join(images_dir, "eval_fid_samples")
-        class_folder = os.path.join(images_dir, "eval_class_samples")
 
-    if local_rank == 0: 
-        os.makedirs(class_folder, exist_ok=True)
-        os.makedirs(save_folder_fid, exist_ok=True)
+    cfg_scale_main = getattr(args, 'cfg_scale', 1.0)
+    eval_cfg_scales = [1.0, cfg_scale_main] if cfg_scale_main != 1.0 else [cfg_scale_main]
 
     if args.remove_ema == False:
-        # Default to the last (highest) decay
         ema_eval_decay = getattr(args, 'ema_eval_decay', None)
         if ema_eval_decay is not None:
             ema_idx = ar_model.ema_decays.index(ema_eval_decay)
@@ -243,61 +235,80 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
 
     num_steps = args.num_images // (args.gen_batch_size * world_size) + 1
     bsz = args.gen_batch_size
-    used_time = 0
-    gen_img_cnt = 0
-    for step in range(num_steps):
-        seed = args.seed + step
-        torch.manual_seed(seed)
-        np.random.seed(seed)
 
-        start_idx = world_size * bsz * step + local_rank * bsz
-        end_idx = start_idx + bsz
-        labels_gen = class_label_gen_world[start_idx:end_idx]
-        labels_gen = torch.Tensor(labels_gen).long().cuda()
-        
-        torch.distributed.barrier()
+    # Map each cfg scale to its fid folder so metrics can be computed after EMA switch-back
+    fid_folders = {}
 
-        torch.cuda.synchronize()
-        start_time = time.time()
+    for eval_cfg in eval_cfg_scales:
+        cfg_tag = f"cfg{eval_cfg:.2g}"
 
-        with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            sampled_images = sample(args, ar_model, denoiser, labels_gen, device, model_params, sampler_params, rae_tokenizer=rae_tokenizer)
+        if epoch is not None:
+            save_folder_fid = os.path.join(images_dir, f"train_fid_samples_{cfg_tag}")
+            class_folder = os.path.join(images_dir, "train_class_samples", f"epoch{epoch}_{cfg_tag}")
+        else:
+            save_folder_fid = os.path.join(images_dir, f"eval_fid_samples_{cfg_tag}")
+            class_folder = os.path.join(images_dir, f"eval_class_samples_{cfg_tag}")
 
-        if step >= 1:
+        fid_folders[eval_cfg] = save_folder_fid
+
+        if local_rank == 0:
+            os.makedirs(class_folder, exist_ok=True)
+            os.makedirs(save_folder_fid, exist_ok=True)
+
+        args.cfg_scale = eval_cfg
+
+        used_time = 0
+        gen_img_cnt = 0
+        for step in range(num_steps):
+            seed = args.seed + step
+            torch.manual_seed(seed)
+            np.random.seed(seed)
+
+            start_idx = world_size * bsz * step + local_rank * bsz
+            end_idx = start_idx + bsz
+            labels_gen = class_label_gen_world[start_idx:end_idx]
+            labels_gen = torch.Tensor(labels_gen).long().cuda()
+
+            torch.distributed.barrier()
+
             torch.cuda.synchronize()
-            used_time += time.time() - start_time
-            gen_img_cnt += bsz
-            print("Generating {} images takes {:.5f} seconds, {:.5f} sec per image".format(gen_img_cnt, used_time, used_time / gen_img_cnt))
+            start_time = time.time()
+
+            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                sampled_images = sample(args, ar_model, denoiser, labels_gen, device, model_params, sampler_params, rae_tokenizer=rae_tokenizer)
+
+            if step >= 1:
+                torch.cuda.synchronize()
+                used_time += time.time() - start_time
+                gen_img_cnt += bsz
+                print(f"[{cfg_tag}] Generating {gen_img_cnt} images takes {used_time:.5f} seconds, {used_time/gen_img_cnt:.5f} sec per image")
+
+            torch.distributed.barrier()
+
+            sampled_images = sampled_images.detach().cpu()
+            sampled_images = (sampled_images + 1) / 2
+
+            for b_id in range(sampled_images.size(0)):
+                img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
+                if img_id >= args.num_images:
+                    break
+                gen_img = np.round(np.clip(sampled_images[b_id].float().numpy().transpose([1, 2, 0]) * 255, 0, 255))
+                gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
+                cv2.imwrite(os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}.png'), gen_img)
+
+        args.cfg_scale = cfg_scale_main  # restore
+
+        if local_rank == 0:
+            all_ids = list(range(args.num_images))
+            selected_ids = random.sample(all_ids, min(len(all_ids), 20))
+            for i, img_id in enumerate(selected_ids):
+                cls = int(class_label_gen_world[img_id])
+                src = os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}.png')
+                dst = os.path.join(class_folder, f'sample_{i}_class_{cls}.png')
+                if os.path.exists(src):
+                    shutil.copy2(src, dst)
 
         torch.distributed.barrier()
-        
-        sampled_images = sampled_images.detach().cpu()
-        sampled_images = (sampled_images + 1) / 2
-
-        for b_id in range(sampled_images.size(0)):
-            img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
-            if img_id >= args.num_images:
-                break
-            gen_img = np.round(np.clip( sampled_images[b_id].float().numpy().transpose([1, 2, 0]) * 255, 0, 255))
-            gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-            cv2.imwrite(os.path.join(save_folder_fid, 'sample_{}.png'.format(str(img_id).zfill(5))), gen_img)
-
-    if local_rank == 0:
-        all_ids = list(range(args.num_images))
-        sample_size = min(len(all_ids), 20)
-        selected_ids = random.sample(all_ids, sample_size)
-        
-        for i, img_id in enumerate(selected_ids):
-            cls = int(class_label_gen_world[img_id])
-            src = os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}.png')
-            
-            class_filename = f'sample_{i}_class_{cls}.png'
-            dst = os.path.join(class_folder, class_filename)
-            
-            if os.path.exists(src):
-                shutil.copy2(src, dst)
-                
-    torch.distributed.barrier()
 
     if args.remove_ema == False:
         print("Switch back from ema")
@@ -307,71 +318,60 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
             denoiser.ema_params_list[ema_idx][i], p.data = p.data.clone(), denoiser.ema_params_list[ema_idx][i]
         torch.cuda.empty_cache()
 
-    # Evaluate the generation quality
+    # Compute metrics for each cfg scale
     if args.fid_statistics:
-        isc = True
-        fid = True
-        kid = False
-        prc = False
-        if os.path.exists(args.fid_statistics_path) == False:
-            print("Statistic path does not exits! ")
+        if not os.path.exists(args.fid_statistics_path):
+            print("Statistic path does not exits!")
+            torch.distributed.barrier()
             return
-        metrics_dict = torch_fidelity.calculate_metrics(
-            input1=save_folder_fid,
-            input2=None,
-            fid_statistics_file=args.fid_statistics_path,
-            cuda=True,
-            isc=isc,
-            fid=fid,
-            kid=kid,
-            prc=prc,
-            verbose=False
-        )
-        if fid:
-            fid_score = metrics_dict['frechet_inception_distance']
-            print("FID: {:.4f}".format(fid_score))
-            if metrics['fid'] is not None:
-                metrics['fid'].append(fid_score)
-        if isc:
-            inception_score = metrics_dict['inception_score_mean']
-            print("Inception Score: {:.4f}".format(inception_score))
-            if metrics['is'] is not None:
-                metrics['is'].append(inception_score)
-        if kid:
-            kid_score = metrics_dict['kernel_inception_distance_mean']
-            print("KID: {:.4f}".format(kid_score))
-        if prc:
-            precision = metrics_dict['precision']
-            recall = metrics_dict['recall']
-            print("Precision: {:.4f}".format(precision))
-            print("Recall: {:.4f}".format(recall))      
-            if metrics['precision'] is not None:
-                metrics['precision'].append(precision)
-            if metrics['recall'] is not None:
-                metrics['recall'].append(recall)
-        
-        if local_rank == 0:
-            # Log Wandb
-            if args.use_wandb and epoch is not None:
-                stats = {
-                    "evaluate/fid": fid_score,
-                    "evaluate/is": inception_score,
-                    "epoch" : epoch
-                }
-                log(stats)
-            # Log Jsonl files
-            if epoch is not None:
-                metrics_file = os.path.join(args.output_dir, "eval.jsonl")
-                row = {"epoch": epoch}
-                if global_step is not None:
-                    row["step"] = int(global_step)
-                if fid:
-                    row["fid"] = float(fid_score)
-                if isc:
-                    row["is"] = float(inception_score)
 
-                with open(metrics_file, "a") as f:
-                    f.write(json.dumps(row) + "\n")
-            shutil.rmtree(save_folder_fid)
+        for eval_cfg in eval_cfg_scales:
+            cfg_tag = f"cfg{eval_cfg:.2g}"
+            is_main = (eval_cfg == eval_cfg_scales[-1])
+            save_folder_fid = fid_folders[eval_cfg]
+
+            metrics_dict = torch_fidelity.calculate_metrics(
+                input1=save_folder_fid,
+                input2=None,
+                fid_statistics_file=args.fid_statistics_path,
+                cuda=True,
+                isc=True,
+                fid=True,
+                kid=False,
+                prc=False,
+                verbose=False
+            )
+
+            fid_score = metrics_dict['frechet_inception_distance']
+            inception_score = metrics_dict['inception_score_mean']
+
+            print(f"FID [{cfg_tag}]: {fid_score:.4f}")
+            print(f"Inception Score [{cfg_tag}]: {inception_score:.4f}")
+
+            if is_main:
+                if metrics['fid'] is not None:
+                    metrics['fid'].append(fid_score)
+                if metrics['is'] is not None:
+                    metrics['is'].append(inception_score)
+
+            if local_rank == 0:
+                if args.use_wandb and epoch is not None:
+                    log({
+                        f"evaluate/fid_{cfg_tag}": fid_score,
+                        f"evaluate/is_{cfg_tag}": inception_score,
+                        "epoch": epoch,
+                    })
+
+                if epoch is not None:
+                    metrics_file = os.path.join(args.output_dir, f"eval_{cfg_tag}.jsonl")
+                    row = {"epoch": epoch, "cfg_scale": eval_cfg}
+                    if global_step is not None:
+                        row["step"] = int(global_step)
+                    row["fid"] = float(fid_score)
+                    row["is"] = float(inception_score)
+                    with open(metrics_file, "a") as f:
+                        f.write(json.dumps(row) + "\n")
+
+                shutil.rmtree(save_folder_fid)
 
     torch.distributed.barrier()
