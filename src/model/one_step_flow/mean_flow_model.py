@@ -49,9 +49,12 @@ class FinalLayer(nn.Module):
 
 class MeanFlowModel(nn.Module):
     """
-    MeanFlow denoising network with z fusion, adaLN-conditioning and dual output heads:
+    MeanFlow denoising network with adaLN-conditioning and dual output heads:
         u : predicted average velocity (mean flow)
         v : predicted instantaneous velocity (auxiliary head).
+    denoiser_type:
+        'ada_ln'        - z conditions only via adaLN (c = t + h + z), no fusion layer.
+        'ada_ln_fusion' - z also fused directly into the residual stream via fusion_emb.
     """
     def __init__(
         self,
@@ -68,6 +71,7 @@ class MeanFlowModel(nn.Module):
         latent_dim=None,
         pred_type='x',
         t_eps=0.05,
+        denoiser_type='ada_ln_fusion',
     ):
         super().__init__()
         self.in_channels = channels
@@ -77,6 +81,7 @@ class MeanFlowModel(nn.Module):
         self.img_size = img_size
         self.pred_type = pred_type
         self.t_eps = t_eps
+        self.denoiser_type = denoiser_type
 
         self.embedding_dim = latent_dim if latent_dim is not None else channels * patch_size ** 2
         self.num_patches = (img_size // patch_size) ** 2
@@ -94,7 +99,9 @@ class MeanFlowModel(nn.Module):
         self.t_embedder = TimestepEmbedder(hidden_dim)
         self.h_embedder = TimestepEmbedder(hidden_dim)
         self.z_proj = nn.Linear(z_hidden_dim, hidden_dim)
-        self.fusion_emb = nn.Linear(2 * hidden_dim, hidden_dim)
+
+        if self.denoiser_type == 'ada_ln_fusion':
+            self.fusion_emb = nn.Linear(2 * hidden_dim, hidden_dim)
 
         shared_depth = max(0, depth - aux_head_depth)
         self.shared_blocks = nn.ModuleList([
@@ -126,10 +133,12 @@ class MeanFlowModel(nn.Module):
             nn.init.constant_(self.x_proj[1].bias, 0)
         else:
             nn.init.normal_(self.x_proj.weight, std=0.02)
-        nn.init.normal_(self.z_proj.weight, std=0.02)                                                                                                                                           
-        nn.init.normal_(self.fusion_emb.weight, std=0.02)
-        nn.init.zeros_(self.fusion_emb.weight[:, self.hidden_dim:])  # zero the z half                                                                                                         
-        nn.init.zeros_(self.fusion_emb.bias)  
+        nn.init.normal_(self.z_proj.weight, std=0.02)
+
+        if self.denoiser_type == 'ada_ln_fusion':
+            nn.init.normal_(self.fusion_emb.weight, std=0.02)
+            nn.init.zeros_(self.fusion_emb.weight[:, self.hidden_dim:])  # zero the z half
+            nn.init.zeros_(self.fusion_emb.bias)
 
         nn.init.normal_(self.t_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
@@ -163,7 +172,11 @@ class MeanFlowModel(nn.Module):
         h_emb = self.h_embedder(h)
 
         c = t_emb + h_emb + z_emb
-        x_in = self.fusion_emb(torch.cat((x_emb, z_emb), dim=-1))
+
+        if self.denoiser_type == 'ada_ln_fusion':
+            x_in = self.fusion_emb(torch.cat((x_emb, z_emb), dim=-1))
+        else:
+            x_in = x_emb
 
         for block in self.shared_blocks:
             x_in = block(x_in, c)

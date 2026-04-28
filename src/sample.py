@@ -86,15 +86,22 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
         num_visible = next_num_visible
 
         pred_indices = mask_to_pred.nonzero(as_tuple=True)
-        z_c = z_cond[pred_indices]
-        z_u = z_uncond[pred_indices] if z_uncond is not None else None
         xt_mask = xt_global[pred_indices]
+        if denoiser.denoising_net.denoiser_type == 'cross_attn':
+            # Each token needs the full z sequence of its image
+            z_c = z_cond[pred_indices[0]]   # (num_tokens, N, z_dim)
+            z_u = z_uncond[pred_indices[0]] if z_uncond is not None else None
+            token_positions = pred_indices[1]
+        else:
+            z_c = z_cond[pred_indices]      # (num_tokens, z_dim)
+            z_u = z_uncond[pred_indices] if z_uncond is not None else None
+            token_positions = None
         y = labels.repeat(z_c.shape[0] // bsz)
 
         # Linear CFG schedule (following MAR): ramp from 1.0 to cfg_scale as more tokens become visible
-        #cfg_scale_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
-        cfg_scale_iter = cfg_scale
-        sampled_x = denoiser.generate(xt_mask, z_c, y, z_uncond=z_u, cfg_scale=cfg_scale_iter, cfg_interval=cfg_interval)
+        cfg_scale_iter = 1.0 + (cfg_scale - 1.0) * num_visible / seq_len
+        #cfg_scale_iter = cfg_scale
+        sampled_x = denoiser.generate(xt_mask, z_c, y, z_uncond=z_u, cfg_scale=cfg_scale_iter, cfg_interval=cfg_interval, token_positions=token_positions)
         cur_tokens[pred_indices] = sampled_x
 
         if args.use_logging and local_rank == 0:
