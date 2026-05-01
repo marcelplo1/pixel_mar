@@ -216,7 +216,7 @@ class ArDecoder(nn.Module):
                 random_vals = torch.rand((seq_len,), device=x.device)
                 mask_prob = 1 - torch.exp(-5 * p_mask)
                 mask = (random_vals < mask_prob).float()
-                if mask.sum() >= 0: #TODO explore the min number of tokens
+                if mask.sum() >= 2:
                     valid_mask_generated = True
         else:  # truncnorm (default)
             mask_rate = stats.truncnorm((min_mask_rate - 1.0) / 0.25, 0, loc=1.0, scale=0.25).rvs(1)[0]

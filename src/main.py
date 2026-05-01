@@ -331,7 +331,7 @@ def main():
             sample_t_mean=model_params.get('sample_t_mean', 0.0),
             sample_t_std=model_params.get('sample_t_std', 1.0),
             t_eps=model_params.get('t_eps', 5e-2),
-            t_eps_sample=sampler_config.get('t_eps_sample', 1e-5),
+            t_eps_sample=sampler_config.get('t_eps_sample', 0.0),
             noise_scale=sampler_config.get('noise_scale', 1.0),
             ema_decay=ema_decay,
             use_logging=args.use_logging,

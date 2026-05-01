@@ -12,7 +12,6 @@ model:
     t_sampling_method: 'logit_normal'
     diffusion_batch_mul: 1
     pred_type: 'x'
-    bottleneck_dim: 128
   ar_params:
     ar_type: 'encoder_decoder'
     encoder_dim: 768
@@ -31,7 +30,7 @@ model:
   denoiser_params:
     hidden_dim: 1024
     depth: 6
-    hidden_ratio: 4.0
+    hidden_ratio: 1.0
     dropout: 0.0
 
 sampler:

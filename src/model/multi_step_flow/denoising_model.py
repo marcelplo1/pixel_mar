@@ -58,8 +58,9 @@ class CrossAttnResBlock(nn.Module):
     def compute_kv(self, z_seq):
         """Precompute K and V from a fixed z_seq — call once before the ODE loop."""
         B, N, _ = z_seq.shape
-        k = self.k_proj(self.norm_z(z_seq))
-        v = self.v_proj(z_seq)
+        z_normed = self.norm_z(z_seq)
+        k = self.k_proj(z_normed)
+        v = self.v_proj(z_normed)
         k = k.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         v = v.reshape(B, N, self.num_heads, self.head_dim).transpose(1, 2)
         k = self.k_norm(k)
@@ -79,8 +80,9 @@ class CrossAttnResBlock(nn.Module):
         if kv is not None:
             k, v = kv
         else:
-            k = self.k_proj(self.norm_z(z_seq))
-            v = self.v_proj(z_seq)
+            z_normed = self.norm_z(z_seq)
+            k = self.k_proj(z_normed)
+            v = self.v_proj(z_normed)
             k = k.reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
             v = v.reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
             k = self.k_norm(k)
