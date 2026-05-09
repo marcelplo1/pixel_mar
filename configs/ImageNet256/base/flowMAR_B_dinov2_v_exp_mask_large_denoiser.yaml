@@ -1,5 +1,5 @@
 model:
-  name: flowMAR_B_dinov2_x_exp_mask_mae_ratio4.0
+  name: flowMAR_B_dinov2_v_exp_mask_large_denoiser
   dataset_name: ImageNet_256
   params:
     img_size: 256
@@ -9,11 +9,11 @@ model:
     t_eps: 5.0e-2
     sample_t_mean: 0.0
     sample_t_std: 1.0
-    train_shift: 6.93
-    sample_shift: 6.93
+    train_shift: 10.0
+    sample_shift: 10.0
     t_sampling_method: 'logit_normal'
     diffusion_batch_mul: 1
-    pred_type: 'x' 
+    pred_type: 'v' 
   rae_params:
     latent_type: 'dinov2'
     latent_dim: 768
@@ -22,12 +22,9 @@ model:
     rae_norm_stats: './rae_models/dinov2/stat.pt'
     rae_decoder_config: './src/rae/rae_decoder_configs/ViTXL'
   ar_params:
-    ar_type: 'encoder_decoder'
-    encoder_dim: 768
-    encoder_depth: 2
-    encoder_num_heads: 12
+    ar_type: 'decoder'
     decoder_dim: 768
-    decoder_depth: 10
+    decoder_depth: 12
     decoder_num_heads: 12
     mlp_ratio: 4.0
     dropout: 0.1
@@ -37,7 +34,7 @@ model:
     mask_condition: False
     min_s: 0.2
   denoiser_params:
-    hidden_dim: 1024
+    hidden_dim: 1536
     depth: 6
     hidden_ratio: 4.0
     dropout: 0.0

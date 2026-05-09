@@ -162,7 +162,7 @@ class DenoisingModel(nn.Module):
             ])
         else:
             self.z_proj = nn.Linear(z_hidden_dim, hidden_dim)
-            if denoiser_type == 'ada_ln_fusion':
+            if denoiser_type == 'ada_ln_fusion' or denoiser_type == 'ada_ln_fusion_only':
                 self.fusion_emb = nn.Linear(2 * hidden_dim, hidden_dim)
             self.blocks = nn.ModuleList([
                 ResBlock(hidden_dim, hidden_ratio=hidden_ratio, proj_drop=dropout)
@@ -200,10 +200,10 @@ class DenoisingModel(nn.Module):
                 nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
         else:
             nn.init.normal_(self.z_proj.weight, std=0.02)
-            if self.denoiser_type == 'ada_ln_fusion':                                                                                                                                               
+            if self.denoiser_type == 'ada_ln_fusion' or self.denoiser_type == 'ada_ln_fusion_only':
                 nn.init.normal_(self.fusion_emb.weight, std=0.02)
-                nn.init.zeros_(self.fusion_emb.weight[:, self.hidden_dim:])  # zero the z half                                                                                                         
-                nn.init.zeros_(self.fusion_emb.bias)  
+                nn.init.zeros_(self.fusion_emb.weight[:, self.hidden_dim:])  # zero the z half
+                nn.init.zeros_(self.fusion_emb.bias)
 
             for block in self.blocks:
                 nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
@@ -226,11 +226,11 @@ class DenoisingModel(nn.Module):
 
     def _forward_cross_attn(self, x, z_seq, t, kv_cache=None, token_positions=None):
         """
-        x:               (B * L, D)    — L=N during training, L=1 during inference
+        x:               (B * L, D)    — L=N during training, L>=1 during inference
         z_seq:           (B, N, z_dim) — full AR context sequence per image
         t:               (B * L,)
         kv_cache:        optional list of (k, v) per block from precompute_kv()
-        token_positions: (B,) - sequence position of each token during sampling
+        token_positions: (B,) for L=1, or (B, L) for batched inference
         """
         B_eff = z_seq.shape[0]
         L = x.shape[0] // B_eff
@@ -242,8 +242,12 @@ class DenoisingModel(nn.Module):
         c = t_emb.reshape(B_eff, L, -1)
 
         if token_positions is not None:
-            # Inference: L=1 token
-            x = x + self.query_pos_emb[:, token_positions, :].transpose(0, 1)  # (B_eff, 1, H)
+            if token_positions.dim() == 1:
+                # L=1: token_positions is (B_eff,)
+                x = x + self.query_pos_emb[:, token_positions, :].transpose(0, 1)
+            else:
+                # Batched: token_positions is (B_eff, L)
+                x = x + self.query_pos_emb[0, token_positions, :]
         else:
             # Training: L=N tokens in canonical order 0..N-1
             x = x + self.query_pos_emb[:, :L, :]
@@ -265,10 +269,15 @@ class DenoisingModel(nn.Module):
         x = self.x_proj(x)
         t = self.t_embedder(t)
         z = self.z_proj(z)
-        c = t + z
 
-        if self.denoiser_type == 'ada_ln_fusion':
+        if self.denoiser_type == 'ada_ln_fusion_only':
             x = self.fusion_emb(torch.cat((x, z), dim=-1))
+            c = t
+        elif self.denoiser_type == 'ada_ln_fusion':
+            x = self.fusion_emb(torch.cat((x, z), dim=-1))
+            c = t + z
+        else:
+            c = t + z
 
         for block in self.blocks:
             x = block(x, c)
