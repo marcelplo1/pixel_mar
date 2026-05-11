@@ -108,18 +108,21 @@ def main():
     args.patch_size = model_params.get('patch_size', 16)
     args.channels = model_params.get('channels', 3)
 
-    # The last folder of output_dir always matches the wandb run name so the
-    # two stay in sync and nothing collides when the parent dir is shared.
-    if global_rank == 0:
-        now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        exp_name = f"{model_name}_{args.img_size}px_{now}"
+    if args.load_check or args.evaluate:
+        # Save everything alongside the checkpoint being loaded
+        args.output_dir = os.path.dirname(os.path.abspath(args.checkpoint_path))
+        exp_name = os.path.basename(args.output_dir)
     else:
-        exp_name = None
-    if dist.is_initialized():
-        obj_list = [exp_name]
-        dist.broadcast_object_list(obj_list, src=0)
-        exp_name = obj_list[0]
-    args.output_dir = os.path.join(args.output_dir, exp_name)
+        if global_rank == 0:
+            now = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+            exp_name = f"{model_name}_{args.img_size}px_{now}"
+        else:
+            exp_name = None
+        if dist.is_initialized():
+            obj_list = [exp_name]
+            dist.broadcast_object_list(obj_list, src=0)
+            exp_name = obj_list[0]
+        args.output_dir = os.path.join(args.output_dir, exp_name)
     os.makedirs(args.output_dir, exist_ok=True)
 
     if global_rank == 0 and not args.evaluate:
