@@ -77,6 +77,32 @@ def sample_order(bsz, seq_len, device, strategy='random'):
 
     raise ValueError(f"Unknown order strategy: {strategy}")
 
+def save_pca_viz(z, file_path, img_size):
+    """Project token features to 3 PCA components → RGB and save the first image in the batch."""
+    z_np = z[0].float().cpu().numpy()  # (N, D)
+    N = z_np.shape[0]
+    H = W = int(N ** 0.5)
+
+    mean = z_np.mean(axis=0, keepdims=True)
+    x = z_np - mean
+    _, _, vt = np.linalg.svd(x, full_matrices=False)
+    comps = vt[:3].T  # (D, 3)
+
+    proj = (z_np - mean) @ comps  # (N, 3)
+    rgb = np.empty((N, 3), dtype=np.float32)
+    for c in range(3):
+        lo, hi = np.percentile(proj[:, c], [1.0, 99.0])
+        if hi <= lo:
+            lo, hi = float(proj[:, c].min()), float(proj[:, c].max())
+        if hi <= lo:
+            lo, hi = 0.0, 1.0
+        rgb[:, c] = np.clip((proj[:, c] - lo) / (hi - lo), 0.0, 1.0)
+
+    img = (rgb.reshape(H, W, 3) * 255).astype(np.uint8)
+    img = cv2.resize(img, (img_size, img_size), interpolation=cv2.INTER_NEAREST)
+    cv2.imwrite(file_path, img[:, :, ::-1])
+
+
 def save_img_as_fig(x, file_path, size=32):
     with torch.no_grad():
         x = (x + 1) / 2

@@ -16,7 +16,7 @@ import torch_fidelity
 from utils.logging_utils import StepTimer
 from utils.wandb_utils import log
 
-from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, unpatchify
+from utils.utils import adjust_learning_rate, patchify, sample_order, save_img_as_fig, save_pca_viz, unpatchify
 
 
 def _module_grad_norm(parameters):
@@ -62,6 +62,15 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
 
         if timer:
             timer.mark('ar_model_end')
+
+        if step == 0 and local_rank == 0 and getattr(args, 'use_logging', False):
+            pca_folder = os.path.join(args.output_dir, "images", "pca_viz")
+            os.makedirs(pca_folder, exist_ok=True)
+            with torch.no_grad():
+                x_masked = x_gt * (1 - mask).unsqueeze(-1)
+                save_pca_viz(x_gt.float(),    os.path.join(pca_folder, f"epoch{epoch:03d}_dinov2.png"),        args.img_size)
+                save_pca_viz(x_masked.float(), os.path.join(pca_folder, f"epoch{epoch:03d}_dinov2_masked.png"), args.img_size)
+                save_pca_viz(z.float(),        os.path.join(pca_folder, f"epoch{epoch:03d}_z_cond.png"),        args.img_size)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             denoiser_loss = denoiser(x_gt, z, mask, labels)

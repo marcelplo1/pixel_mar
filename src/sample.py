@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import math
 
-from utils.utils import sample_order, save_img_as_fig, unpatchify
+from utils.utils import sample_order, save_img_as_fig, save_pca_viz, unpatchify
 
 def mask_by_order(mask_len, order, bsz, seq_len, device ):
     masking = torch.zeros(bsz, seq_len).cuda()
@@ -73,11 +73,12 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
     xt_global = noise_scale * torch.randn(bsz, seq_len, embed_dim, device=device)
     num_visible = 0
     for i, next_num_visible in enumerate(schedule):
+        recon_weight = getattr(args, 'recon_weight', 0.0)
         if cfg_scale != 1.0:
-            z_cond, mask, _ = ar_model(cur_tokens, orders, labels, num_visible)
+            z_cond, mask, x_recon = ar_model(cur_tokens, orders, labels, num_visible)
             z_uncond, _, _ = ar_model(cur_tokens, orders, labels, num_visible, force_unconditional=True)
         else:
-            z_cond, mask, _ = ar_model(cur_tokens, orders, labels, num_visible)
+            z_cond, mask, x_recon = ar_model(cur_tokens, orders, labels, num_visible)
             z_uncond = None
 
         ids_to_predict = orders[:, num_visible:next_num_visible]
@@ -105,14 +106,29 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
         cur_tokens[pred_indices] = sampled_x
 
         if args.use_logging and local_rank == 0:
-            folder = os.path.join(args.output_dir, "images", "ar_generation_steps")
-            os.makedirs(folder, exist_ok=True)
-            file_path = os.path.join(folder, "pass0_step_{}.png".format(i))
+            base = os.path.join(args.output_dir, "images")
+            folder_steps  = os.path.join(base, "ar_generation_steps")
+            folder_z_pca  = os.path.join(base, "ar_condition_z_pca")
+            folder_recon  = os.path.join(base, "ar_condition_z_decoded")
+            os.makedirs(folder_steps, exist_ok=True)
 
             if use_latent:
-                save_img_as_fig(rae_tokenizer.decode(cur_tokens), file_path=file_path, size=img_size)
+                save_img_as_fig(rae_tokenizer.decode(cur_tokens),
+                                file_path=os.path.join(folder_steps, "step_{}.png".format(i)), size=img_size)
+                os.makedirs(folder_z_pca, exist_ok=True)
+                save_pca_viz(z_cond, os.path.join(folder_z_pca, "step_{}.png".format(i)), img_size)
+                if recon_weight > 0:
+                    os.makedirs(folder_recon, exist_ok=True)
+                    save_img_as_fig(rae_tokenizer.decode(x_recon).clamp(-1, 1),
+                                    file_path=os.path.join(folder_recon, "step_{}.png".format(i)), size=img_size)
             else:
-                save_img_as_fig(unpatchify(cur_tokens, patch_size, channels=channels), file_path=file_path, size=img_size)
+                save_img_as_fig(unpatchify(cur_tokens, patch_size, channels=channels),
+                                file_path=os.path.join(folder_steps, "step_{}.png".format(i)), size=img_size)
+                
+                if recon_weight > 0:
+                    os.makedirs(folder_recon, exist_ok=True)
+                    save_img_as_fig(unpatchify(x_recon, patch_size, channels=channels).clamp(-1, 1),
+                                    file_path=os.path.join(folder_recon, "step_{}.png".format(i)), size=img_size)
 
     if use_latent:
         img = rae_tokenizer.decode(cur_tokens)
