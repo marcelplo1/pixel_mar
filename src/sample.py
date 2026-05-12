@@ -116,7 +116,7 @@ def sample(args, ar_model, denoiser, labels, device, model_params, sampler_param
                 save_img_as_fig(rae_tokenizer.decode(cur_tokens),
                                 file_path=os.path.join(folder_steps, "step_{}.png".format(i)), size=img_size)
                 os.makedirs(folder_z_pca, exist_ok=True)
-                save_pca_viz(z_cond, os.path.join(folder_z_pca, "step_{}.png".format(i)), img_size)
+                save_pca_viz(z_cond, os.path.join(folder_z_pca, "step_{}.png".format(i)), img_size, idx=0)
                 if recon_weight > 0:
                     os.makedirs(folder_recon, exist_ok=True)
                     save_img_as_fig(rae_tokenizer.decode(x_recon).clamp(-1, 1),

@@ -65,12 +65,28 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
 
         if step == 0 and local_rank == 0 and getattr(args, 'use_logging', False):
             pca_folder = os.path.join(args.output_dir, "images", "pca_viz")
-            os.makedirs(pca_folder, exist_ok=True)
             with torch.no_grad():
                 x_masked = x_gt * (1 - mask).unsqueeze(-1)
-                save_pca_viz(x_gt.float(),    os.path.join(pca_folder, f"epoch{epoch:03d}_dinov2.png"),        args.img_size)
-                save_pca_viz(x_masked.float(), os.path.join(pca_folder, f"epoch{epoch:03d}_dinov2_masked.png"), args.img_size)
-                save_pca_viz(z.float(),        os.path.join(pca_folder, f"epoch{epoch:03d}_z_cond.png"),        args.img_size)
+                pca_idx = int(np.random.randint(x_gt.shape[0]))
+
+                # spatial visible-token mask for the chosen sample, upsampled to image resolution
+                n_tok = mask.shape[1]
+                h_tok = w_tok = int(n_tok ** 0.5)
+                visible = (1 - mask[pca_idx]).reshape(h_tok, w_tok)
+                scale = samples.shape[-1] // h_tok
+                visible_img = visible.repeat_interleave(scale, 0).repeat_interleave(scale, 1)
+                gt_masked = samples[pca_idx] * visible_img.to(samples.dtype)
+
+                def _pca_path(name):
+                    sub = os.path.join(pca_folder, name)
+                    os.makedirs(sub, exist_ok=True)
+                    return os.path.join(sub, f"epoch{epoch:03d}.png")
+
+                save_img_as_fig(samples[pca_idx:pca_idx + 1].float(), _pca_path("gt"),        size=args.img_size)
+                save_img_as_fig(gt_masked.unsqueeze(0).float(),       _pca_path("gt_masked"), size=args.img_size)
+                save_pca_viz(x_gt.float(),     _pca_path("dinov2"),        args.img_size, idx=pca_idx)
+                save_pca_viz(x_masked.float(),  _pca_path("dinov2_masked"), args.img_size, idx=pca_idx)
+                save_pca_viz(z.float(),         _pca_path("z_cond"),        args.img_size, idx=pca_idx)
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             denoiser_loss = denoiser(x_gt, z, mask, labels)

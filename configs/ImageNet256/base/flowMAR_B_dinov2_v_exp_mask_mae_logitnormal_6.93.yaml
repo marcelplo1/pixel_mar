@@ -1,5 +1,5 @@
 model:
-  name: flowMAR_B_dinov2_v_exp_mask_mae_logitnormal
+  name: flowMAR_B_dinov2_v_exp_mask_mae_logitnormal_6.93
   dataset_name: ImageNet_256
   params:
     img_size: 256
@@ -7,8 +7,8 @@ model:
     ema_decay: [0.999, 0.9995, 0.9999]
     sample_t_mean: 0.0
     sample_t_std: 1.0
-    train_shift: 10.0
-    sample_shift: 10.0
+    train_shift: 6.93
+    sample_shift: 6.93
     t_sampling_method: 'logit_normal'
     diffusion_batch_mul: 1
     pred_type: 'v' 

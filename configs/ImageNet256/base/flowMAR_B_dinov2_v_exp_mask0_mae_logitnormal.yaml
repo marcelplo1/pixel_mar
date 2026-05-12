@@ -1,5 +1,5 @@
 model:
-  name: flowMAR_B_dinov2_v_exp_mask_mae_logitnormal
+  name: flowMAR_B_dinov2_v_exp_mask0_mae_logitnormal
   dataset_name: ImageNet_256
   params:
     img_size: 256
@@ -32,8 +32,8 @@ model:
     class_token_size: 64
     mask_rate_token_size: 8
     train_mask_schedule: 'exp'
-    mask_condition: False
-    min_s: 0.2
+    mask_condition: True
+    min_s: 0.0
   denoiser_params:
     hidden_dim: 1024
     depth: 6

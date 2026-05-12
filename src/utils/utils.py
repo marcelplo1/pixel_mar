@@ -77,9 +77,12 @@ def sample_order(bsz, seq_len, device, strategy='random'):
 
     raise ValueError(f"Unknown order strategy: {strategy}")
 
-def save_pca_viz(z, file_path, img_size):
-    """Project token features to 3 PCA components → RGB and save the first image in the batch."""
-    z_np = z[0].float().cpu().numpy()  # (N, D)
+def save_pca_viz(z, file_path, img_size, idx=None):
+    """Project token features to 3 PCA components → RGB and save one image of the batch.
+    """
+    if idx is None:
+        idx = int(np.random.randint(z.shape[0]))
+    z_np = z[idx].float().cpu().numpy()  # (N, D)
     N = z_np.shape[0]
     H = W = int(N ** 0.5)
 
