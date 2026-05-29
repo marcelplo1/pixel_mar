@@ -28,7 +28,9 @@ pip install -r requirements.txt
 The FID evaluation depends on a customized [torch-fidelity](https://github.com/LTH14/torch-fidelity) fork, which is installed automatically via the requirements file.
 
 ## Training
-All experiments use 4× H100 GPUs, batch size 512 (128 per GPU), 200 epochs.
+All experiments use 4× H100 GPUs, batch size 512 (128 per GPU), 200 epochs. 
+
+You just have to change the ImageNet path: "--data_path ./ImageNet2012"
 
 ### SD-VAE baseline
 ```bash
@@ -48,7 +50,7 @@ flow_mar/src/main.py \
 --data_path ./ImageNet2012 \
 --fid_statistics \
 --fid_statistics_path ./fid_stats/adm_in256_stats_full.npz \
---cfg_scale 1.5 \
+--cfg_scale 6.0 \
 --denoiser_type ada_ln \
 --use_wandb 
 ```
@@ -71,7 +73,7 @@ flow_mar/src/main.py \
 --data_path ./ImageNet2012 \
 --fid_statistics \
 --fid_statistics_path ./fid_stats/adm_in256_stats_full.npz \
---cfg_scale 1.5 \
+--cfg_scale 1.0 \
 --denoiser_type ada_ln_fusion \
 --use_wandb 
 ```
@@ -94,7 +96,7 @@ flow_mar/src/main.py \
 --data_path ./ImageNet2012 \
 --fid_statistics \
 --fid_statistics_path ./fid_stats/adm_in256_stats_full.npz \
---cfg_scale 1.5 \
+--cfg_scale 2.0 \
 --denoiser_type ada_ln_fusion \
 --use_wandb 
 ```
@@ -117,7 +119,7 @@ flow_mar/src/main.py \
 --cfg_scale 1.0 \
 --denoiser_type ada_ln_fusion \
 --load_check \
---checkpoint_path ./checkpoint_epoch200.pt \
+--checkpoint_path .checkpoints/flowMAR_B_dinov2_final/checkpoint_epoch200.pt \
 --evaluate
 ```
 
