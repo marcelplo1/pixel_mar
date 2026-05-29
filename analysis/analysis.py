@@ -305,7 +305,7 @@ def main():
         args.output_dir = os.path.join(PROJECT_ROOT, 'analysis', 'plots')
     if args.rae_decoder_config is None:
         args.rae_decoder_config = os.path.join(
-            PROJECT_ROOT, 'src', 'tokenizers', 'rae_decoder_configs', 'ViTXL'
+            PROJECT_ROOT, 'src', 'image_tokenizers', 'rae_decoder_configs', 'ViTXL'
         )
     if args.dinov2_decoder_ckp is None:
         args.dinov2_decoder_ckp = os.path.join(PROJECT_ROOT, 'tokenizer_models', 'dinov2', 'model.pt')

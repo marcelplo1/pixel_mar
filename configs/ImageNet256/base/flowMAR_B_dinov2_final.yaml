@@ -18,7 +18,7 @@ model:
     rae_encoder: 'facebook/dinov2-with-registers-base'
     rae_decoder_ckp: './tokenizer_models/dinov2/model.pt'
     rae_norm_stats: './tokenizer_models/dinov2/stat.pt'
-    rae_decoder_config: './src/tokenizers/rae_decoder_configs/ViTXL'
+    rae_decoder_config: './src/image_tokenizers/rae_decoder_configs/ViTXL'
   ar_params:
     ar_type: 'encoder_decoder'
     encoder_dim: 768
