@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from math import sqrt
 
-from rae.vae import AutoencoderKL
+from tokenizers.vae import AutoencoderKL
 
 
 class VaeTokenizer(nn.Module):

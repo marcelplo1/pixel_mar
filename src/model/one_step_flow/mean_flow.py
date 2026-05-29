@@ -161,7 +161,7 @@ class MeanFlow(nn.Module):
         return loss
 
     @torch.no_grad()
-    def generate(self, xt, z, labels, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0), token_positions=None):
+    def generate(self, xt, z, labels, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
         device = z.device
         B = xt.size(0)
 

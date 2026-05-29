@@ -5,8 +5,6 @@ import torch
 import math
 import numpy as np
 import io
-import lmdb
-import pickle
 import matplotlib.pyplot as plt
 import torch.nn as nn
 from torch.utils.data import Dataset
@@ -113,36 +111,6 @@ def save_img_as_fig(x, file_path, size=32):
     gen_img = cv2.resize(gen_img, (size, size), interpolation=cv2.INTER_LINEAR)
     cv2.imwrite(file_path, gen_img[:, :, ::-1])
 
-def save_multiple_imgs_as_fig(imgs, patch_size, filename, path="./output"):
-    bsz = imgs.shape[0]
-    n_row = int(bsz ** 0.5)
-    n_col = int(bsz / n_row)
-
-    plt.figure(figsize=(n_col, n_row))
-    for i in range(bsz):
-        if imgs.shape[1] == 1:
-            plot = imgs[i, 0].cpu().numpy()
-        else:
-            plot = imgs[i].permute(1, 2, 0)
-            plot = plot.cpu().numpy()
-        plt.subplot(n_row, n_col, i + 1)
-        plt.imshow(plot, cmap="gray")
-        plt.axis("off")
-
-    plt.suptitle("Generated Batch Samples")
-    os.makedirs(path, exist_ok=True)
-    plt.savefig(os.path.join(path, "batch_plot.png"))
-    plt.show()
-
-def save_plot(data, filename, path="./output", y_label="y-axis"):
-    plt.figure()
-    plt.plot(data)
-    plt.xlabel("x-epochs")
-    plt.ylabel(y_label)
-    plt.title(f"{filename.split('.')[0]} over Epochs")
-    os.makedirs(path, exist_ok=True)
-    plt.savefig(f"{path}/" + filename)
-    plt.close()
 
 def center_crop_arr(pil_image, image_size):
     """
@@ -163,85 +131,3 @@ def center_crop_arr(pil_image, image_size):
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
-
-def write_csv(name, path, list):
-    csv_file = os.path.join(path, name)
-    with open(csv_file, "w", newline="") as f:
-        writer = csv.writer(f)
-        for item in list:
-            writer.writerow([item])
-
-class SingleImageDataset(Dataset):
-    """Dataset that returns the same image repeatedly, for overfitting tests."""
-    def __init__(self, image_path, img_size, label=0, length=64):
-        from torchvision import transforms
-        self.length = length
-        self.label = label
-        transform = transforms.Compose([
-            transforms.Lambda(lambda img: center_crop_arr(img, img_size)),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
-        ])
-        img = Image.open(image_path).convert('RGB')
-        self.image = transform(img)
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, idx):
-        return self.image, self.label
-
-
-class ImageNetLMDB(Dataset):
-    def __init__(self, db_path, transform=None):
-        self.db_path = db_path
-        self.transform = transform
-        
-        # Open the environment once to get the number of entries
-        env = lmdb.open(db_path, readonly=True, lock=False, readahead=False, meminit=False)
-        with env.begin(write=False) as txn:
-            # txn.stat()['entries'] counts all keys including metadata.
-            # Use the 'length' metadata key if available, otherwise find
-            # the actual number of sequential integer keys.
-            length_val = txn.get(b'length') or txn.get(b'num_samples')
-            if length_val is not None:
-                self.length = int(length_val)
-            else:
-                # Binary search for the last valid integer key
-                lo, hi = 0, txn.stat()['entries']
-                while lo < hi:
-                    mid = (lo + hi) // 2
-                    if txn.get(str(mid).encode('ascii')) is not None:
-                        lo = mid + 1
-                    else:
-                        hi = mid
-                self.length = lo
-        env.close()
-        
-        self.env = None
-
-    def _init_db(self):
-        """Initializes the LMDB environment for each worker process."""
-        self.env = lmdb.open(self.db_path, readonly=True, lock=False, readahead=False, meminit=False)
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, index):
-        if self.env is None:
-            self._init_db()
-
-        with self.env.begin(write=False) as txn:
-            byte_key = str(index).encode('ascii')
-            byteflow = txn.get(byte_key)
-
-        if byteflow is None:
-            raise KeyError(f"Key {index} not found in LMDB")
-
-        data = pickle.loads(byteflow)
-        img = Image.open(io.BytesIO(data['image'])).convert('RGB')
-        label = data['label']
-
-        if self.transform is not None:
-            img = self.transform(img)
-        return img, label

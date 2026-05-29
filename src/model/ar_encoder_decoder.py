@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 from scipy import stats
 
-from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
+from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast
 
 
 class Block(nn.Module):
@@ -128,7 +128,7 @@ class ArEncoderDecoder(nn.Module):
         )
 
     def initialize_weights(self):
-        # Match MAR: normal_(std=0.02) for all learnable embeddings/pos_embs.
+        # Normal_(std=0.02) for all learnable embeddings/pos_embs.
         nn.init.normal_(self.class_emb.weight, std=0.02)
         nn.init.normal_(self.fake_latent, std=0.02)
         nn.init.normal_(self.mask_token, std=0.02)

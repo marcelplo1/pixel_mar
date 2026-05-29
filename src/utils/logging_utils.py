@@ -80,12 +80,7 @@ def log_model_parameters(ar_model, denoiser, device, args):
             num_patches = N * diff_mul
             D_denoiser = dnet.embedding_dim
             dummy_xt = torch.randn(num_patches, D_denoiser, device=device, requires_grad=True)
-            if dnet.denoiser_type == 'cross_attn':
-                # z_seq shape: (B_eff, N, z_dim) with B_eff = diff_mul (B=1 dummy)
-                z_hidden_dim = dnet.blocks[0].k_proj.in_features
-                dummy_z = torch.randn(diff_mul, N, z_hidden_dim, device=device, requires_grad=True)
-            else:
-                dummy_z = torch.randn(num_patches, dnet.z_proj.in_features, device=device, requires_grad=True)
+            dummy_z = torch.randn(num_patches, dnet.z_proj.in_features, device=device, requires_grad=True)
             dummy_t = torch.rand(num_patches, device=device)
 
             with FlopCounterMode(display=False) as counter:

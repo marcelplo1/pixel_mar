@@ -4,7 +4,7 @@ from scipy import stats
 import torch
 import torch.nn as nn
 
-from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast, get_2d_sincos_pos_embed
+from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast
 from utils.utils import patchify
 
 
@@ -109,6 +109,14 @@ class ArDecoder(nn.Module):
         )
 
     def initialize_weights(self):
+        # Normal_(std=0.02) for all learnable embeddings/pos_embs.
+        nn.init.normal_(self.class_emb.weight, std=0.02)
+        nn.init.normal_(self.fake_latent, std=0.02)
+        nn.init.normal_(self.mask_token, std=0.02)
+        nn.init.normal_(self.encoder_pos_emb, std=0.02)
+        nn.init.normal_(self.decoder_pos_emb, std=0.02)
+        nn.init.normal_(self.diffusion_pos_emb, std=0.02)
+
         def _init_weights(m):
             if isinstance(m, nn.Linear):
                 torch.nn.init.xavier_uniform_(m.weight)
@@ -119,17 +127,6 @@ class ArDecoder(nn.Module):
                 nn.init.constant_(m.weight, 1.0)
 
         self.apply(_init_weights)
-
-        grid_size = int(self.seq_len ** 0.5)
-        pos_embed_grid = get_2d_sincos_pos_embed(self.decoder_dim, grid_size)
-        full_pos_embed = torch.zeros(self.seq_len + self.total_c_token_size, self.decoder_dim)
-        full_pos_embed[self.total_c_token_size:, :] = torch.from_numpy(pos_embed_grid).float()
-        self.decoder_pos_emb.data.copy_(full_pos_embed.unsqueeze(0))
-
-        nn.init.trunc_normal_(self.mask_token, std=0.02)
-        nn.init.trunc_normal_(self.class_emb.weight, std=0.02)
-        nn.init.trunc_normal_(self.fake_latent, std=0.02)
-        nn.init.normal_(self.diffusion_pos_emb, std=0.02)
 
         if self.mask_rate_emb is not None:
             nn.init.normal_(self.mask_rate_emb.mlp[0].weight, std=0.02)

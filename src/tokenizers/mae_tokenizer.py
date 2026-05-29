@@ -1,40 +1,44 @@
 import torch
 import torch.nn as nn
-from transformers import Dinov2WithRegistersModel, AutoConfig, AutoImageProcessor
+from transformers import ViTMAEForPreTraining, AutoImageProcessor
 from math import sqrt
-from rae.rae_decoder import GeneralDecoder
+from tokenizers.rae_decoder import GeneralDecoder
+from transformers import AutoConfig
 
 
-class Dinov2Tokenizer(nn.Module):
+class MaeTokenizer(nn.Module):
     """
-        DinoV2 Tokenizer: frozen DINOv2 encoder + frozen RAE decoder.
+        MAE Tokenizer: frozen MAE encoder + frozen RAE decoder.
     """
     def __init__(
         self,
-        dinov2_path='facebook/dinov2-with-registers-base',
-        rae_decoder_config_path='./src/rae/rae_decoder_configs/ViTXL',
-        encoder_input_size=224,
+        mae_path='facebook/vit-mae-base',
+        rae_decoder_config_path='./src/tokenizers/rae_decoder_configs/ViTXL',
+        encoder_input_size=256,
         decoder_patch_size=16,
         eps=1e-5,
-        rae_decoder_ckp="./rae_models/rae_decoder/model.pt",
-        rae_norm_stats="./rae_models/rae_stats/stat.pt"
+        rae_decoder_ckp="./tokenizer_models/mae/model.pt",
+        rae_norm_stats="./tokenizer_models/mae/stat.pt"
     ):
         super().__init__()
 
-        # ---- Encoder (frozen DINOv2) ----
-        self.encoder = Dinov2WithRegistersModel.from_pretrained(dinov2_path)
+        # ---- Encoder (frozen MAE) ----
+        self.encoder = ViTMAEForPreTraining.from_pretrained(mae_path).vit
         self.encoder.requires_grad_(False)
+        # Remove affine of final layernorm (match RAE training)
         self.encoder.layernorm.elementwise_affine = False
         self.encoder.layernorm.weight = None
         self.encoder.layernorm.bias = None
+        # Disable masking
+        self.encoder.config.mask_ratio = 0.0
 
         self.encoder_input_size = encoder_input_size
         self.latent_dim = self.encoder.config.hidden_size
         self.encoder_patch_size = self.encoder.config.patch_size
         self.num_patches = (encoder_input_size // self.encoder_patch_size) ** 2
 
-        # DINOv2 normalization (ImageNet stats from processor)
-        proc = AutoImageProcessor.from_pretrained(dinov2_path)
+        # MAE normalization (ImageNet stats from processor)
+        proc = AutoImageProcessor.from_pretrained(mae_path)
         self.register_buffer('encoder_mean', torch.tensor(proc.image_mean).view(1, 3, 1, 1))
         self.register_buffer('encoder_std', torch.tensor(proc.image_std).view(1, 3, 1, 1))
 
@@ -78,12 +82,12 @@ class Dinov2Tokenizer(nn.Module):
     @torch.no_grad()
     def encode(self, images):
         """
-        Encode images to normalized DINOv2 feature tokens.
+        Encode images to normalized MAE feature tokens.
         """
         # Convert from [-1, 1] to [0, 1]
         x = (images + 1) / 2
 
-        # Resize to DINOv2 input size if needed
+        # Resize to encoder input size if needed
         _, _, h, w = x.shape
         if h != self.encoder_input_size or w != self.encoder_input_size:
             x = nn.functional.interpolate(
@@ -91,12 +95,15 @@ class Dinov2Tokenizer(nn.Module):
                 mode='bicubic', align_corners=False
             )
 
-        # Apply DINOv2 normalization (ImageNet mean/std)
+        # Apply ImageNet normalization
         x = (x - self.encoder_mean) / self.encoder_std
 
-        outputs = self.encoder(x, output_hidden_states=True)
-        unused_token_num = 5  # 1 CLS + 4 register tokens
-        z = outputs.last_hidden_state[:, unused_token_num:]
+        # Ordered noise to prevent any masking
+        patch_num = (x.shape[2] // self.encoder_patch_size) * (x.shape[3] // self.encoder_patch_size)
+        noise = torch.arange(patch_num).unsqueeze(0).expand(x.shape[0], -1).to(x.device).float()
+
+        outputs = self.encoder(x, noise, interpolate_pos_encoding=True)
+        z = outputs.last_hidden_state[:, 1:]  # remove CLS token
 
         if self.do_normalization:
             B, N, D = z.shape
@@ -112,7 +119,7 @@ class Dinov2Tokenizer(nn.Module):
     @torch.no_grad()
     def decode(self, z):
         """
-        Decode normalized DINOv2 features back to pixel images.
+        Decode normalized MAE features back to pixel images.
         """
         # Denormalize (reshape to 2D to match RAE convention)
         if self.do_normalization:
@@ -127,7 +134,7 @@ class Dinov2Tokenizer(nn.Module):
         output = self.decoder(z, drop_cls_token=False).logits
         x_rec = self.decoder.unpatchify(output)
 
-        # Un-normalize from DINOv2 space to [0, 1]
+        # Un-normalize from ImageNet space to [0, 1]
         x_rec = x_rec * self.encoder_std + self.encoder_mean
 
         # Convert to [-1, 1] (matching dataset normalization)

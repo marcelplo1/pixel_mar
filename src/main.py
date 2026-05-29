@@ -20,7 +20,7 @@ from model.ar_decoder import ArDecoder
 from utils import ddp
 from utils.configs_utils import parse_configs
 from utils.logging_utils import log_model_parameters
-from utils.utils import center_crop_arr, ImageNetLMDB, SingleImageDataset
+from utils.utils import center_crop_arr
 from train_eval import calc_val_loss, evaluate, train_one_epoch
 from utils.wandb_utils import initialize_wandb
 
@@ -34,13 +34,13 @@ def create_parser():
     parser.add_argument("--load_check", action="store_true", help="Load model from checkpoint before training")
     parser.add_argument("--checkpoint_path", type=str, default="./output/checkpoint_last.pt", help="Loading path for checkpoint")
     parser.add_argument("--start_epoch", type=int, default=0, help="Start epoch from checkpoint")
-    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "ada_ln_fusion", "ada_ln_fusion_only", "cross_attn"])
+    parser.add_argument("--denoiser_type", type=str, default="ada_ln", help="Type of the denoiser", choices=["ada_ln", "ada_ln_fusion", "ada_ln_fusion_only"])
     parser.add_argument("--log_parameters", action="store_true", help="Log the model parameters")
 
     # Training
-    parser.add_argument("--batch_size", type=int, default=16, help="Batch size for training")
-    parser.add_argument("--epochs", type=int, default=1000, help="Training epochs")
-    parser.add_argument("--warmup_epochs", type=int, default=100, help="Number of warmup epochs")
+    parser.add_argument("--batch_size", type=int, default=128, help="Batch size for training")
+    parser.add_argument("--epochs", type=int, default=200, help="Training epochs")
+    parser.add_argument("--warmup_epochs", type=int, default=50, help="Number of warmup epochs")
     parser.add_argument("--lr", type=float, default=None, help="Learning rate (absolute lr)")
     parser.add_argument("--blr", type=float, default=1e-4, help="Base learning rate: absolute_lr = base_lr * total_batch_size / 256")
     parser.add_argument("--min_lr", type=float, default=0.0, help="Lower lr bound for cyclic schedulers that hit 0")
@@ -50,16 +50,12 @@ def create_parser():
     parser.add_argument("--grad_log_freq", type=int, default=0, help="Step interval for per-layer grad norms")
     parser.add_argument("--save_freq", type=int, default=5, help="Frequency of saving the checkpoint")
     parser.add_argument("--label_drop_prob", type=float, default=0.1, help="Learning rate")
-    parser.add_argument("--overfit_single_image", action="store_true", help="Train on a single image to validate the pipeline")
-
-    # Auxiliary losses
-    parser.add_argument("--recon_weight", type=float, default=0, help="Weight for MAR reconstruction loss (0 = disabled)")
 
     # Sampling
-    parser.add_argument("--gen_batch_size", type=int, default=16, help="Batch size for sampling")
+    parser.add_argument("--gen_batch_size", type=int, default=128, help="Batch size for sampling")
     parser.add_argument("--evaluate", action="store_true", help="Evaluate the model after training")
     parser.add_argument("--num_images", type=int, default=50000, help="Number of images to generate during evaluation")
-    parser.add_argument("--online_eval_freq", type=int, default=25, help="Frequency of online evaluation during training")
+    parser.add_argument("--online_eval_freq", type=int, default=20, help="Frequency of online evaluation during training")
     parser.add_argument("--remove_ema", action="store_true", help="Use exponential moving average for the model parameters")
     parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-free guidance scale (1.0 = no guidance)")
     parser.add_argument("--cfg_interval_min", type=float, default=0.0, help="CFG interval lower bound (denoiser timestep)")
@@ -71,7 +67,6 @@ def create_parser():
     parser.add_argument("--has_fixed_target_class", action="store_true", help="Whether to use a fixed target class for training")
     parser.add_argument("--fixed_target_class", type=int, default=0, help="Fix the target class to train on")
     parser.add_argument("--data_path", type=str, default="./data/imagenet", help="Path to the imagenet train dataset")
-    parser.add_argument("--dataset_type", type=str, default="imagefolder", help="Dataset format", choices=["lmdb", "imagefolder"])
     parser.add_argument("--fid_statistics", action="store_true", help="Use online FID calculation")
     parser.add_argument("--fid_statistics_path", type=str, default="./fid_stats/adm_in256_stats_full.npz", help="Path to fid statistic file")
     
@@ -108,6 +103,7 @@ def main():
     args.patch_size = model_params.get('patch_size', 16)
     args.channels = model_params.get('channels', 3)
 
+    # Setup output dir
     if args.load_check or args.evaluate:
         # Save everything alongside the checkpoint being loaded
         args.output_dir = os.path.dirname(os.path.abspath(args.checkpoint_path))
@@ -125,6 +121,7 @@ def main():
         args.output_dir = os.path.join(args.output_dir, exp_name)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Save config and args in output-dir
     if global_rank == 0 and not args.evaluate:
         with open(os.path.join(args.output_dir, "args.yaml"), "w") as f:
             yaml.safe_dump(vars(args), f, sort_keys=True)
@@ -147,13 +144,10 @@ def main():
         transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5])
     ])
 
-    if args.dataset_type == 'lmdb':
-        dataset = ImageNetLMDB(os.path.join(args.data_path, 'imagenet_train.lmdb'), transform=transform)
-        val_dataset = ImageNetLMDB(os.path.join(args.data_path, 'imagenet_val.lmdb'), transform=transform)
-    elif args.dataset_type == 'imagefolder':
-        dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
-        val_dataset = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform)
+    dataset = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform)
+    val_dataset = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform)
 
+    # Overfit on a singe class
     if args.has_fixed_target_class:
         if hasattr(dataset, 'targets'):
             targets = torch.tensor(dataset.targets)
@@ -163,27 +157,15 @@ def main():
             val_targets = torch.tensor(val_dataset.targets)
             val_indices = (val_targets == args.fixed_target_class).nonzero(as_tuple=True)[0]
             val_dataset = Subset(val_dataset, val_indices)
-        else:
-            print(f"Warning: dataset type '{args.dataset_type}' does not support fixed target class filtering, skipping.")
 
         if len(dataset) == 0:
             print("Fixed dataset class not found!")
             return
         print(f"Filtered dataset to class {args.fixed_target_class}. New size: {len(dataset)}")
 
-    if args.overfit_single_image:
-        img_path = "data/single_image.JPEG"
-        dataset = SingleImageDataset(img_path, args.img_size, length=max(args.batch_size * world_size * 8, 512))
-        val_dataset = SingleImageDataset(img_path, args.img_size, length=max(args.batch_size * world_size, 64))
-        args.has_fixed_target_class = True
-        args.fixed_target_class = 0
-        args.label_drop_prob = 0.0
-        print(f"Overfitting on single image: {img_path}")
-
     sampler_train = DistributedSampler(
         dataset, num_replicas=world_size, rank=global_rank, shuffle=True
     )
-
     sampler_val = DistributedSampler(
         val_dataset, num_replicas=world_size, rank=global_rank, shuffle=False
     )
@@ -191,19 +173,18 @@ def main():
     num_workers = 8
     dataloader = DataLoader(dataset, batch_size=args.batch_size, sampler=sampler_train,
                             num_workers=num_workers, pin_memory=True, persistent_workers=True)
-
     dataloader_val = DataLoader(val_dataset, batch_size=args.batch_size, sampler=sampler_val,
                             num_workers=num_workers, pin_memory=True, persistent_workers=True
     )
     
-    # RAE tokenizer for latent space mode
-    rae_tokenizer = None
+    # tokenizer for latent space mode
+    tokenizer = None
     latent_dim = None
     if rae_params is not None:
         latent_type = rae_params.get('latent_type', 'dinov2')
         if latent_type == 'dinov2':
-            from rae.dinov2_tokenizer import Dinov2Tokenizer
-            rae_tokenizer = Dinov2Tokenizer(
+            from tokenizers.dinov2_tokenizer import Dinov2Tokenizer
+            tokenizer = Dinov2Tokenizer(
                 dinov2_path=rae_params.get('rae_encoder', 'facebook/dinov2-with-registers-base'),
                 rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
                 rae_decoder_ckp=rae_params.get('rae_decoder_ckp', None),
@@ -212,8 +193,8 @@ def main():
                 decoder_patch_size=args.patch_size,
             ).to(device)
         elif latent_type == 'mae':
-            from rae.mae_tokenizer import MaeTokenizer
-            rae_tokenizer = MaeTokenizer(
+            from tokenizers.mae_tokenizer import MaeTokenizer
+            tokenizer = MaeTokenizer(
                 mae_path=rae_params.get('rae_encoder', 'facebook/vit-mae-base'),
                 rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
                 rae_decoder_ckp=rae_params.get('rae_decoder_ckp', None),
@@ -222,23 +203,24 @@ def main():
                 decoder_patch_size=args.patch_size,
             ).to(device)
         elif latent_type == 'vae':
-            from rae.vae_tokenizer import VaeTokenizer
-            rae_tokenizer = VaeTokenizer(
-                vae_path=rae_params.get('vae_path', 'rae_models/vae/kl16.ckpt'),
+            from tokenizers.vae_tokenizer import VaeTokenizer
+            tokenizer = VaeTokenizer(
+                vae_path=rae_params.get('vae_path', 'tokenizer_models/vae/kl16.ckpt'),
                 embed_dim=rae_params.get('latent_dim', 16),
                 latent_scale=rae_params.get('latent_scale', 0.2325),
                 img_size=args.img_size,
             ).to(device)
         else:
             raise ValueError(f"Unknown latent_type: '{latent_type}'.")
-        rae_tokenizer.eval()
-        latent_dim = rae_tokenizer.latent_dim
-        print(f"Latent space mode: RAE dim={latent_dim}, patches={rae_tokenizer.num_patches}")
+        tokenizer.eval()
+        latent_dim = tokenizer.latent_dim
+        print(f"Latent space mode: RAE dim={latent_dim}, patches={tokenizer.num_patches}")
 
     ema_decay = model_params.get('ema_decay', [0.9999])
     if not isinstance(ema_decay, list):
         ema_decay = [ema_decay]
 
+    # Autoregressive model
     ar_type = ar_params.get('ar_type', 'decoder')
     ar_common_kwargs = dict(
         img_size=args.img_size,
@@ -273,9 +255,9 @@ def main():
     else:
         raise ValueError(f"Unknown ar_type: '{ar_type}'.")
 
+    # Flow matching denoiser 
     flow_type = model_params.get('flow_type', 'multi_step')
     if flow_type == 'multi_step':
-        # Load denoising model from config file
         denoising_model = DenoisingModel(
             img_size=args.img_size,
             patch_size=args.patch_size,
@@ -290,7 +272,6 @@ def main():
             bottleneck_dim=model_params.get('bottleneck_dim', None),
             latent_dim=latent_dim
         )
-        #Load denoiser from config file
         denoiser = Denoiser(
             denoising_model=denoising_model,
             output_dir=args.output_dir,
@@ -355,7 +336,7 @@ def main():
     ar_model_single = ar_model.module
     denoiser_single = denoiser.module
     
-    # Scale learning rate based on effective batch size (linear scaling rule)
+    # Scale learning rate based on effective batch size (linear scaling rule) -> only if args.lr is not fixed
     eff_batch_size = args.batch_size * world_size
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
@@ -363,8 +344,8 @@ def main():
     print("actual lr: %.2e" % args.lr)
     print("effective batch size: %d" % eff_batch_size)
 
+    # Single optimizer for both model parts 
     opt_params = list(ar_model.parameters()) + list(denoiser.parameters())
-
     optimizer = optim.AdamW(
         opt_params,
         lr=args.lr,
@@ -372,6 +353,7 @@ def main():
         betas=(0.9, 0.95)
     )
 
+    # Load checkpoints
     if args.load_check or args.evaluate:
         print("Loading from checkpoint...")
         checkpoint = torch.load(args.checkpoint_path, map_location='cpu', weights_only=False)
@@ -382,10 +364,7 @@ def main():
         else:
             missing = ar_model_single.load_state_dict(checkpoint['mae'], strict=False).missing_keys
             ema_ar_raw = checkpoint['ema_mae']
-        #TODO: Change in the final code. Zero out params missing from old checkpoints so they act as no-ops
-        for key in missing:
-            print(f"  Zeroing missing key: {key}")
-            nn.init.zeros_(dict(ar_model_single.named_parameters())[key])
+
         denoiser_single.load_state_dict(checkpoint['denoiser'], strict=False)
         optimizer.load_state_dict(checkpoint['optimizer'])
         ema_den_raw = checkpoint['ema_denoiser']
@@ -419,7 +398,7 @@ def main():
     metrics = {k: [] for k in ['loss', 'fid', 'is', 'precision', 'recall']}
     if args.evaluate:
         print("Starting sampling...")
-        evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=None, metrics=metrics, rae_tokenizer=rae_tokenizer)
+        evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=None, metrics=metrics, tokenizer=tokenizer)
         return
 
     print("Starting training...")
@@ -428,21 +407,21 @@ def main():
             dataloader.sampler.set_epoch(epoch)
 
         global_step = train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single, denoiser_single,
-                                       optimizer, device, rae_tokenizer=rae_tokenizer)
+                                       optimizer, device, tokenizer=tokenizer)
 
-        calc_val_loss(args, ar_model_single, denoiser_single, dataloader_val, epoch, device, rae_tokenizer=rae_tokenizer)
+        calc_val_loss(args, ar_model_single, denoiser_single, dataloader_val, epoch, device, tokenizer=tokenizer)
 
         is_last_epoch = (epoch == args.epochs - 1)
 
         if int(epoch) % args.online_eval_freq == 0 or is_last_epoch:
             print("Starting online evaluation...")
-            evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics, rae_tokenizer=rae_tokenizer, global_step=global_step)
+            evaluate(args=args, ar_model=ar_model_single, denoiser=denoiser_single, device=device, model_params=model_params, sampler_params=sampler_config, epoch=epoch, metrics=metrics, tokenizer=tokenizer, global_step=global_step)
             print("Online evaluation finsihed")
 
+        # Save Checkpoint
         if global_rank == 0:
             if int(epoch) % args.save_freq == 0 or is_last_epoch:
                 print("Saving online checkpoint...")
-                #save_path = os.path.join(args.output_dir, "checkpoint_{}.pt".format(epoch))
                 ckpt_path = os.path.join(args.output_dir, "checkpoint_last.pt")
 
                 checkpoint = {

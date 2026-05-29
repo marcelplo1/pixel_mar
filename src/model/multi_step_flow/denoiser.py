@@ -108,11 +108,7 @@ class Denoiser(nn.Module):
         labels = labels.repeat(self.diffusion_batch_mul*N)
         mask = mask.reshape(B*N).repeat(self.diffusion_batch_mul)
 
-        if self.denoising_net.denoiser_type == 'cross_attn':
-            # Keep full sequence shape: (B*dbm, N, z_dim)
-            z_input = z.repeat(self.diffusion_batch_mul, 1, 1)
-        else:
-            z_input = z.reshape(B*N, -1).repeat(self.diffusion_batch_mul, 1)
+        z_input = z.reshape(B*N, -1).repeat(self.diffusion_batch_mul, 1)
 
         if self.training:
             t_eps = self.t_eps
@@ -144,7 +140,7 @@ class Denoiser(nn.Module):
         return loss
 
     @torch.no_grad()
-    def generate(self, xt, z, labels, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0), token_positions=None):
+    def generate(self, xt, z, labels, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
         device = z.device
         bsz = xt.size(0)
         timesteps = torch.linspace(1.0 - self.t_eps_sample, self.t_eps_sample, self.steps+1, device=device)
@@ -160,19 +156,12 @@ class Denoiser(nn.Module):
         else:
             raise NotImplementedError
 
-        # Precompute K/V once for the entire ODE loop
-        kv_cache, kv_cache_uncond = None, None
-        if self.denoising_net.denoiser_type == 'cross_attn':
-            kv_cache = self.denoising_net.precompute_kv(z)
-            if z_uncond is not None and cfg_scale != 1.0:
-                kv_cache_uncond = self.denoising_net.precompute_kv(z_uncond)
-
         # ode
         for i in range(self.steps-1):
             t = timesteps[i]
             t_next = timesteps[i + 1]
-            xt = stepper(xt, z, t, t_next, z_uncond, cfg_scale, cfg_interval, kv_cache, kv_cache_uncond, token_positions)
-        xt = self._euler_step(xt, z, timesteps[-2], timesteps[-1], z_uncond, cfg_scale, cfg_interval, kv_cache, kv_cache_uncond, token_positions)
+            xt = stepper(xt, z, t, t_next, z_uncond, cfg_scale, cfg_interval)
+        xt = self._euler_step(xt, z, timesteps[-2], timesteps[-1], z_uncond, cfg_scale, cfg_interval)
         return xt
 
     def _pred_to_velocity(self, pred, xt, t):
@@ -182,20 +171,16 @@ class Denoiser(nn.Module):
             return (xt - pred) / t.clamp_min(self.t_eps)
 
     @torch.no_grad()
-    def _forward_sample(self, xt, z, t, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0),
-                        kv_cache=None, kv_cache_uncond=None, token_positions=None):
-        # Conditional prediction
-        pred_cond = self.denoising_net(xt, z, t.view(-1), kv_cache=kv_cache, token_positions=token_positions)
+    def _forward_sample(self, xt, z, t, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        pred_cond = self.denoising_net(xt, z, t.view(-1))
         v_cond = self._pred_to_velocity(pred_cond, xt, t)
 
         if cfg_scale == 1.0 or z_uncond is None:
             return v_cond
 
-        # Unconditional prediction
-        pred_uncond = self.denoising_net(xt, z_uncond, t.view(-1), kv_cache=kv_cache_uncond, token_positions=token_positions)
+        pred_uncond = self.denoising_net(xt, z_uncond, t.view(-1))
         v_uncond = self._pred_to_velocity(pred_uncond, xt, t)
 
-        # CFG interval masking
         low, high = cfg_interval
         interval_mask = (t < high) & ((low == 0) | (t > low))
         scale = torch.where(interval_mask, cfg_scale, 1.0)
@@ -203,23 +188,16 @@ class Denoiser(nn.Module):
         return v_uncond + scale * (v_cond - v_uncond)
 
     @torch.no_grad()
-    def _euler_step(self, xt, z, t, t_next, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0),
-                    kv_cache=None, kv_cache_uncond=None, token_positions=None):
-        v_pred = self._forward_sample(xt, z, t, z_uncond, cfg_scale, cfg_interval, kv_cache, kv_cache_uncond, token_positions)
-        xt_next = xt + (t_next - t) * v_pred
-        return xt_next
+    def _euler_step(self, xt, z, t, t_next, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        v_pred = self._forward_sample(xt, z, t, z_uncond, cfg_scale, cfg_interval)
+        return xt + (t_next - t) * v_pred
 
     @torch.no_grad()
-    def _heun_step(self, xt, z, t, t_next, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0),
-                   kv_cache=None, kv_cache_uncond=None, token_positions=None):
-        v_pred_t = self._forward_sample(xt, z, t, z_uncond, cfg_scale, cfg_interval, kv_cache, kv_cache_uncond, token_positions)
-
+    def _heun_step(self, xt, z, t, t_next, z_uncond=None, cfg_scale=1.0, cfg_interval=(0.0, 1.0)):
+        v_pred_t = self._forward_sample(xt, z, t, z_uncond, cfg_scale, cfg_interval)
         xt_next_euler = xt + (t_next - t) * v_pred_t
-        v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next, z_uncond, cfg_scale, cfg_interval, kv_cache, kv_cache_uncond, token_positions)
-
-        v_pred = 0.5 * (v_pred_t + v_pred_t_next)
-        xt_next = xt + (t_next - t) * v_pred
-        return xt_next
+        v_pred_t_next = self._forward_sample(xt_next_euler, z, t_next, z_uncond, cfg_scale, cfg_interval)
+        return xt + (t_next - t) * 0.5 * (v_pred_t + v_pred_t_next)
 
     @torch.no_grad()
     def update_ema(self):

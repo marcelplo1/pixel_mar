@@ -26,7 +26,7 @@ def _module_grad_norm(parameters):
     return torch.norm(torch.stack([g.norm(2) for g in grads]), 2)
 
 
-def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single, denoiser_single, optimizer, device, rae_tokenizer=None):
+def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single, denoiser_single, optimizer, device, tokenizer=None):
     ar_model.train()
     denoiser.train()
 
@@ -45,9 +45,9 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if rae_tokenizer is not None:
+        if tokenizer is not None:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                x_gt = rae_tokenizer.encode(samples)
+                x_gt = tokenizer.encode(samples)
         else:
             x_gt = patchify(samples, args.patch_size)
         orders = sample_order(x_gt.shape[0], x_gt.shape[1], device)
@@ -55,49 +55,14 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         if timer:
             timer.mark('ar_model_start')
 
-        recon_weight = getattr(args, 'recon_weight', 0.0)
-
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             z, mask, x_recon = ar_model(x_gt, orders, labels)
 
         if timer:
             timer.mark('ar_model_end')
 
-        if step == 0 and local_rank == 0 and getattr(args, 'use_logging', False):
-            pca_folder = os.path.join(args.output_dir, "images", "pca_viz")
-            with torch.no_grad():
-                x_masked = x_gt * (1 - mask).unsqueeze(-1)
-                pca_idx = int(np.random.randint(x_gt.shape[0]))
-
-                # spatial visible-token mask for the chosen sample, upsampled to image resolution
-                n_tok = mask.shape[1]
-                h_tok = w_tok = int(n_tok ** 0.5)
-                visible = (1 - mask[pca_idx]).reshape(h_tok, w_tok)
-                scale = samples.shape[-1] // h_tok
-                visible_img = visible.repeat_interleave(scale, 0).repeat_interleave(scale, 1)
-                gt_masked = samples[pca_idx] * visible_img.to(samples.dtype)
-
-                def _pca_path(name):
-                    sub = os.path.join(pca_folder, name)
-                    os.makedirs(sub, exist_ok=True)
-                    return os.path.join(sub, f"epoch{epoch:03d}.png")
-
-                save_img_as_fig(samples[pca_idx:pca_idx + 1].float(), _pca_path("gt"),        size=args.img_size)
-                save_img_as_fig(gt_masked.unsqueeze(0).float(),       _pca_path("gt_masked"), size=args.img_size)
-                save_pca_viz(x_gt.float(),     _pca_path("dinov2"),        args.img_size, idx=pca_idx)
-                save_pca_viz(x_masked.float(),  _pca_path("dinov2_masked"), args.img_size, idx=pca_idx)
-                save_pca_viz(z.float(),         _pca_path("z_cond"),        args.img_size, idx=pca_idx)
-
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-            denoiser_loss = denoiser(x_gt, z, mask, labels)
-
-        loss = denoiser_loss
-
-        recon_loss = None
-        if recon_weight > 0:
-            B, N, D = x_gt.shape
-            recon_loss = ((x_recon - x_gt) ** 2 * mask.unsqueeze(-1)).sum() / (mask.sum() * D + 1e-8)
-            loss = loss + recon_weight * recon_loss
+            loss = denoiser(x_gt, z, mask, labels)
 
         if timer:
             timer.mark('den_end')
@@ -119,6 +84,7 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
         ar_grad_norm = _module_grad_norm(list(ar_model.parameters()))
         den_grad_norm = _module_grad_norm(list(denoiser.parameters()))
 
+        # Logging gradients
         per_layer_norms = {}
         grad_hist_values = None
         if log_grad_details:
@@ -157,7 +123,6 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
 
             stats = {
                 "train/loss": loss.item(),
-                "train/denoiser_loss": denoiser_loss.item(),
                 "train/lr": optimizer.param_groups[0]['lr'],
                 "train/grad_norm": total_grad_norm.item(),
                 "train/grad_norm_ar": ar_grad_norm.item(),
@@ -167,9 +132,6 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
                 stats.update(per_layer_norms)
                 if grad_hist_values is not None:
                     stats["train/grad_hist"] = wandb.Histogram(grad_hist_values)
-            if recon_loss is not None:
-                stats["train/recon_loss"] = recon_loss.item()
-
             # Extra losses for MeanFlow objective
             denoiser_inner = denoiser_single if hasattr(denoiser_single, 'last_loss_u_raw') else None
             if denoiser_inner is not None:
@@ -183,22 +145,19 @@ def train_one_epoch(args, epoch, dataloader, ar_model, denoiser, ar_model_single
     return optimizer_step
 
 @torch.no_grad()
-def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_tokenizer=None):
+def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, tokenizer=None):
     local_rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
     world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
-    recon_weight = getattr(args, 'recon_weight', 0.0)
-
     losses = []
-    recon_losses = []
     for step, batch in enumerate(val_dataloader):
         samples, labels = batch
         samples = samples.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        if rae_tokenizer is not None:
+        if tokenizer is not None:
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                x_gt = rae_tokenizer.encode(samples)
+                x_gt = tokenizer.encode(samples)
         else:
             x_gt = patchify(samples, args.patch_size)
 
@@ -206,28 +165,17 @@ def calc_val_loss(args, ar_model, denoiser, val_dataloader, epoch, device, rae_t
 
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             z, mask, x_recon = ar_model(x_gt, orders, labels)
-            denoiser_loss = denoiser(x_gt, z, mask, labels)
+            loss = denoiser(x_gt, z, mask, labels)
 
-        losses.append(denoiser_loss.item())
-
-        if recon_weight > 0:
-            B, N, D = x_gt.shape
-            rl = ((x_recon - x_gt) ** 2 * mask.unsqueeze(-1)).sum() / (mask.sum() * D + 1e-8)
-            recon_losses.append(rl.item())
+        losses.append(loss.item())
 
     if local_rank == 0:
         if args.use_wandb:
-            stats = {
-                "evaluation/val_loss": sum(losses) / len(losses),
-                "epoch" : epoch
-            }
-            if recon_losses:
-                stats["evaluation/val_recon_loss"] = sum(recon_losses) / len(recon_losses)
-            log(stats)
+            log({"evaluation/val_loss": sum(losses) / len(losses), "epoch": epoch})
 
     torch.distributed.barrier()
 
-def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epoch=None, metrics=None, rae_tokenizer=None, global_step=None):
+def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epoch=None, metrics=None, tokenizer=None, global_step=None):
     ar_model.eval()
     denoiser.eval()
 
@@ -237,7 +185,12 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
     images_dir = os.path.join(args.output_dir, "images")
 
     cfg_scale_main = getattr(args, 'cfg_scale', 1.0)
-    eval_cfg_scales = [1.0, cfg_scale_main] if cfg_scale_main != 1.0 else [cfg_scale_main]
+    if getattr(args, 'evaluate', False):
+        # Standalone evaluation: only run the requested cfg_scale
+        eval_cfg_scales = [cfg_scale_main]
+    else:
+        # Runs always unguided evaluation as well
+        eval_cfg_scales = [1.0, cfg_scale_main] if cfg_scale_main != 1.0 else [cfg_scale_main]
 
     if args.remove_ema == False:
         ema_eval_decay = getattr(args, 'ema_eval_decay', None)
@@ -300,7 +253,7 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
             start_time = time.time()
 
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                sampled_images = sample(args, ar_model, denoiser, labels_gen, device, model_params, sampler_params, rae_tokenizer=rae_tokenizer)
+                sampled_images = sample(args, ar_model, denoiser, labels_gen, device, model_params, sampler_params, tokenizer=tokenizer)
 
             if step >= 1:
                 torch.cuda.synchronize()
@@ -317,9 +270,10 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
                 img_id = step * sampled_images.size(0) * world_size + local_rank * sampled_images.size(0) + b_id
                 if img_id >= args.num_images:
                     break
+                cls = int(class_label_gen_world[img_id])
                 gen_img = np.round(np.clip(sampled_images[b_id].float().numpy().transpose([1, 2, 0]) * 255, 0, 255))
                 gen_img = gen_img.astype(np.uint8)[:, :, ::-1]
-                cv2.imwrite(os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}.png'), gen_img)
+                cv2.imwrite(os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}_class_{cls}.png'), gen_img)
 
         args.cfg_scale = cfg_scale_main  # restore
 
@@ -328,7 +282,7 @@ def evaluate(args, ar_model, denoiser, device, model_params, sampler_params, epo
             selected_ids = random.sample(all_ids, min(len(all_ids), 20))
             for i, img_id in enumerate(selected_ids):
                 cls = int(class_label_gen_world[img_id])
-                src = os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}.png')
+                src = os.path.join(save_folder_fid, f'sample_{str(img_id).zfill(5)}_class_{cls}.png')
                 dst = os.path.join(class_folder, f'sample_{i}_class_{cls}.png')
                 if os.path.exists(src):
                     shutil.copy2(src, dst)
