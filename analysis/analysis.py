@@ -226,9 +226,9 @@ def _try_decode(tok, z):
 
 
 def build_tokenizers(device, args, with_decoder=False):
-    from tokenizers.dinov2_tokenizer import Dinov2Tokenizer
-    from tokenizers.mae_tokenizer import MaeTokenizer
-    from tokenizers.vae_tokenizer import VaeTokenizer
+    from image_tokenizers.dinov2_tokenizer import Dinov2Tokenizer
+    from image_tokenizers.mae_tokenizer import MaeTokenizer
+    from image_tokenizers.vae_tokenizer import VaeTokenizer
     decoder_config = args.rae_decoder_config if with_decoder else None
     return {
         'SD-VAE (KL-16)': VaeTokenizer(

@@ -183,7 +183,7 @@ def main():
     if rae_params is not None:
         latent_type = rae_params.get('latent_type', 'dinov2')
         if latent_type == 'dinov2':
-            from tokenizers.dinov2_tokenizer import Dinov2Tokenizer
+            from image_tokenizers.dinov2_tokenizer import Dinov2Tokenizer
             tokenizer = Dinov2Tokenizer(
                 dinov2_path=rae_params.get('rae_encoder', 'facebook/dinov2-with-registers-base'),
                 rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
@@ -193,7 +193,7 @@ def main():
                 decoder_patch_size=args.patch_size,
             ).to(device)
         elif latent_type == 'mae':
-            from tokenizers.mae_tokenizer import MaeTokenizer
+            from image_tokenizers.mae_tokenizer import MaeTokenizer
             tokenizer = MaeTokenizer(
                 mae_path=rae_params.get('rae_encoder', 'facebook/vit-mae-base'),
                 rae_decoder_config_path=rae_params.get('rae_decoder_config', None),
@@ -203,7 +203,7 @@ def main():
                 decoder_patch_size=args.patch_size,
             ).to(device)
         elif latent_type == 'vae':
-            from tokenizers.vae_tokenizer import VaeTokenizer
+            from image_tokenizers.vae_tokenizer import VaeTokenizer
             tokenizer = VaeTokenizer(
                 vae_path=rae_params.get('vae_path', 'tokenizer_models/vae/kl16.ckpt'),
                 embed_dim=rae_params.get('latent_dim', 16),

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import ViTMAEForPreTraining, AutoImageProcessor
 from math import sqrt
-from tokenizers.rae_decoder import GeneralDecoder
+from image_tokenizers.rae_decoder import GeneralDecoder
 from transformers import AutoConfig
 
 

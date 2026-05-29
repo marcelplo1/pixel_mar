@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from transformers import Dinov2WithRegistersModel, AutoConfig, AutoImageProcessor
 from math import sqrt
-from tokenizers.rae_decoder import GeneralDecoder
+from image_tokenizers.rae_decoder import GeneralDecoder
 
 
 class Dinov2Tokenizer(nn.Module):

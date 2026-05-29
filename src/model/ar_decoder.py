@@ -4,7 +4,7 @@ from scipy import stats
 import torch
 import torch.nn as nn
 
-from model.model_utils import Attention, AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast
+from model.model_utils import AttentionRoPE, RMSNorm, SwiGLUFFN, TimestepEmbedder, VisionRotaryEmbeddingFast
 from utils.utils import patchify
 
 
